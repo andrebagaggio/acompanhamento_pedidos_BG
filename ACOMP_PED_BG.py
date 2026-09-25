@@ -37,6 +37,12 @@ STATUS_MIN_TAREFAS = 29
 # Código de status de tarefa considerado "Concluído" (para o ranking de colaboradores)
 TASK_STATUS_CONCLUIDO = "9"
 
+# Colunas do dataframe de tarefas (usado em vários pontos para inicializar dataframe vazio)
+COLUNAS_TAREFAS = [
+    "Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd",
+    "DeLoc", "ParaLoc", "UserKey", "StartTime", "EndTime", "ReasonCod",
+]
+
 # Tradução dos códigos de status do WMS
 STATUS_MAP = {
     "00": "Ordem em branco",
@@ -209,7 +215,9 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
     """
     Consulta, em paralelo, as tarefas geradas (endpoint tasks/list) para uma lista de pedidos.
     Retorna uma lista "achatada" com uma linha por tarefa (já com o status traduzido),
-    incluindo o usuário responsável e os horários de início/fim (para o ranking de colaboradores).
+    incluindo usuário responsável, horários de início/fim, motivo (reasonkey) e a
+    posição de origem (fromloc) — usados no ranking de colaboradores, no ranking de
+    motivos e na classificação de pedidos por localização.
     """
     tarefas_flat, falhas = [], []
     total = len(lista_pedidos)
@@ -241,6 +249,7 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
                             "UserKey": tarefa.get("userkey", ""),
                             "StartTime": tarefa.get("starttime"),
                             "EndTime": tarefa.get("endtime"),
+                            "ReasonCod": tarefa.get("reasonkey", ""),
                         }
                     )
             except requests.exceptions.RequestException:
@@ -255,9 +264,10 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
 
 def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     """
-    A partir das tarefas com status Concluído, monta o ranking dos colaboradores:
-    quantidade de tarefas separadas, tempo médio de separação (EndTime - StartTime)
-    e a média de peças separadas por hora (soma de Qtd / soma de horas trabalhadas).
+    A partir das tarefas com status Concluído (e sem motivo/reasoncode preenchido — essas
+    são desconsideradas do ranking), monta o ranking dos colaboradores: quantidade de
+    tarefas separadas, tempo médio de separação (EndTime - StartTime) e a média de
+    peças separadas por hora (soma de Qtd / soma de horas trabalhadas).
     """
     colunas_saida = ["Usuário", "Tarefas Concluídas", "Tempo Médio (min)", "Peças/Hora"]
     if df_tarefas.empty:
@@ -265,6 +275,7 @@ def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) ->
 
     df = df_tarefas[df_tarefas["StatusCod"].astype(str).str.strip() == TASK_STATUS_CONCLUIDO].copy()
     df = df[df["UserKey"].astype(str).str.strip() != ""]
+    df = df[df["ReasonCod"].astype(str).str.strip() == ""]  # desconsidera tarefas com motivo preenchido
     if df.empty:
         return pd.DataFrame(columns=colunas_saida)
 
@@ -294,6 +305,69 @@ def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) ->
     resumo = resumo.rename(columns={"UserKey": "Usuário", "Tarefas_Concluidas": "Tarefas Concluídas"})
     resumo = resumo[colunas_saida].sort_values("Tarefas Concluídas", ascending=False).head(top_n)
     return resumo.reset_index(drop=True)
+
+
+def calcular_ranking_motivos(df_tarefas: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    """Ranking dos motivos (ReasonCod) presentes nas tarefas, por número de ocorrências."""
+    colunas_saida = ["Motivo", "Ocorrências"]
+    if df_tarefas.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df = df_tarefas[df_tarefas["ReasonCod"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    contagem = df["ReasonCod"].value_counts().reset_index()
+    contagem.columns = colunas_saida
+    return contagem.head(top_n)
+
+
+def classificar_localizacao(fromloc) -> str:
+    """
+    Classifica a posição de origem (fromloc) de uma tarefa:
+    termina em '000' ou '010' -> Baixo; termina em '020' -> Médio; demais -> Alto.
+    """
+    loc = str(fromloc).strip()
+    if loc.endswith("000") or loc.endswith("010"):
+        return "Baixo"
+    if loc.endswith("020"):
+        return "Médio"
+    return "Alto"
+
+
+def classificar_pedidos_por_localizacao(df_tarefas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classifica cada pedido conforme as posições (fromloc) das suas tarefas:
+    - Só Alto -> ALTO / Só Baixo -> BAIXO / Só Médio -> MÉDIO
+    - Alto + Baixo -> Parcial A/B
+    - Médio + Baixo -> Parcial M/B
+    - Alto + Médio -> Parcial A/M
+    - Alto + Médio + Baixo -> Misto A/M/B
+    """
+    colunas_saida = ["Pedido", "Classificação"]
+    if df_tarefas.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df = df_tarefas.copy()
+    df["_Faixa"] = df["DeLoc"].apply(classificar_localizacao)
+
+    mapa_combinacoes = {
+        frozenset({"Alto"}): "ALTO",
+        frozenset({"Baixo"}): "BAIXO",
+        frozenset({"Médio"}): "MÉDIO",
+        frozenset({"Alto", "Baixo"}): "Parcial A/B",
+        frozenset({"Médio", "Baixo"}): "Parcial M/B",
+        frozenset({"Alto", "Médio"}): "Parcial A/M",
+        frozenset({"Alto", "Médio", "Baixo"}): "Misto A/M/B",
+    }
+
+    resumo = (
+        df.groupby("Pedido")["_Faixa"]
+        .apply(lambda faixas: mapa_combinacoes[frozenset(faixas)])
+        .reset_index()
+    )
+    resumo.columns = colunas_saida
+    return resumo
 
 
 # =========================================================
@@ -353,11 +427,7 @@ if consultar:
                 pedidos_elegiveis, token, max_workers=paralelismo
             )
             st.session_state["df_tarefas"] = (
-                pd.DataFrame(tarefas_flat) if tarefas_flat
-                else pd.DataFrame(columns=[
-                    "Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd",
-                    "DeLoc", "ParaLoc", "UserKey", "StartTime", "EndTime",
-                ])
+                pd.DataFrame(tarefas_flat) if tarefas_flat else pd.DataFrame(columns=COLUNAS_TAREFAS)
             )
             st.session_state["tarefas_falhas"] = tarefas_falhas
 
@@ -397,13 +467,7 @@ if "df_pedidos" in st.session_state:
     col3.metric("📊 Média de Peças/Pedido", media_pecas)
     col4.metric("🏷️ Status Predominante", status_predominante)
 
-    df_tarefas = st.session_state.get(
-        "df_tarefas",
-        pd.DataFrame(columns=[
-            "Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd",
-            "DeLoc", "ParaLoc", "UserKey", "StartTime", "EndTime",
-        ]),
-    )
+    df_tarefas = st.session_state.get("df_tarefas", pd.DataFrame(columns=COLUNAS_TAREFAS))
     tarefas_falhas = st.session_state.get("tarefas_falhas", [])
     total_tarefas = len(df_tarefas)
     col5.metric("🗂️ Tarefas Geradas", total_tarefas)
@@ -453,6 +517,7 @@ if "df_pedidos" in st.session_state:
     if not ranking.empty:
         st.divider()
         st.subheader("🏆 Top 10 Colaboradores - Tarefas Concluídas")
+        st.caption("Tarefas com motivo (ReasonCod) preenchido não entram nesse ranking.")
 
         rc1, rc2 = st.columns(2)
 
@@ -486,6 +551,54 @@ if "df_pedidos" in st.session_state:
             f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
             "Peças/Hora = soma de peças separadas ÷ soma de horas trabalhadas pelo colaborador."
         )
+
+    # ---- Ranking de motivos (reasoncode) ----
+    ranking_motivos = calcular_ranking_motivos(df_tarefas)
+    if not ranking_motivos.empty:
+        st.divider()
+        st.subheader("🚩 Ranking de Motivos (Reason Code)")
+        fig_motivos = px.bar(
+            ranking_motivos.sort_values("Ocorrências"),
+            x="Ocorrências",
+            y="Motivo",
+            orientation="h",
+            text_auto=True,
+        )
+        fig_motivos.update_layout(showlegend=False)
+        st.plotly_chart(fig_motivos, use_container_width=True)
+        st.dataframe(ranking_motivos, use_container_width=True, hide_index=True)
+
+    # ---- Classificação de pedidos por localização (fromloc) ----
+    classificacao_pedidos = classificar_pedidos_por_localizacao(df_tarefas)
+    if not classificacao_pedidos.empty:
+        st.divider()
+        st.subheader("📍 Classificação dos Pedidos por Localização")
+        st.caption(
+            "Baseado no fromloc das tarefas: terminação 000/010 = Baixo, 020 = Médio, demais = Alto. "
+            "Pedidos com mais de uma faixa aparecem como parcial/misto."
+        )
+
+        cl1, cl2 = st.columns(2)
+        with cl1:
+            contagem_classificacao = classificacao_pedidos["Classificação"].value_counts().reset_index()
+            contagem_classificacao.columns = ["Classificação", "Qtd Pedidos"]
+            fig_classificacao = px.bar(
+                contagem_classificacao,
+                x="Classificação",
+                y="Qtd Pedidos",
+                color="Classificação",
+                text_auto=True,
+            )
+            fig_classificacao.update_layout(showlegend=False)
+            st.plotly_chart(fig_classificacao, use_container_width=True)
+
+        with cl2:
+            st.dataframe(
+                classificacao_pedidos.sort_values("Pedido"),
+                use_container_width=True,
+                hide_index=True,
+                height=380,
+            )
 
     st.divider()
 
