@@ -549,7 +549,7 @@ if "df_pedidos" in st.session_state:
 
         st.dataframe(ranking, use_container_width=True, hide_index=True)
         st.caption(
-            "Tempo médio calculado a partir de StartTime/EndTime das tarefas com status "
+            "Tempo médio calculado a partir de Data Início/Data Fim das tarefas com status "
             f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
             "Peças/Hora = soma de peças separadas ÷ soma de horas trabalhadas pelo colaborador."
         )
@@ -576,7 +576,7 @@ if "df_pedidos" in st.session_state:
         st.divider()
         st.subheader("📍 Classificação dos Pedidos por Localização")
         st.caption(
-            "Baseado no fromloc das tarefas: terminação 000/010 = Baixo, 020 = Médio, demais = Alto. "
+            "Baseado no no local de origem das tarefas: terminação 000/010 = Baixo, 020 = Médio, demais = Alto. "
             "Pedidos com mais de uma faixa aparecem como parcial/misto."
         )
 
