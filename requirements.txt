@@ -1,7 +1,4 @@
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+streamlit
+pandas
 requests
-pandas as pd
-streamlit as st
-plotly.express as px
+plotly
