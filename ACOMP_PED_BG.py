@@ -328,7 +328,7 @@ def classificar_localizacao(fromloc) -> str:
     termina em '000' ou '010' -> Baixo; termina em '020' -> Médio; demais -> Alto.
     """
     loc = str(fromloc).strip()
-    if loc.endswith("000") or loc.endswith("010"):
+    if loc.endswith("000") or loc.endswith("010") or loc.endswith("01") or loc.endswith("02") or loc.endswith("03") or loc.endswith("04") or loc.endswith("05") or loc.endswith("06"):
         return "Baixo"
     if loc.endswith("020"):
         return "Médio"
