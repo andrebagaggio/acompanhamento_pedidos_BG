@@ -4,7 +4,7 @@ Acompanhamento Gráfico - Infor WMS
 App Streamlit para consultar uma faixa de pedidos no Infor WMS
 via API, exibir indicadores e gráficos de status.
 
-Modo mais on time possivel, posso usar na bag tmb 
+Modo mais on time possivel, posso usar na bag tmb
 """
 
 import re
@@ -33,6 +33,9 @@ TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
 
 # A partir deste status (inclusive) o pedido já possui tarefas geradas no WMS
 STATUS_MIN_TAREFAS = 29
+
+# Código de status de tarefa considerado "Concluído" (para o ranking de colaboradores)
+TASK_STATUS_CONCLUIDO = "9"
 
 # Tradução dos códigos de status do WMS
 STATUS_MAP = {
@@ -205,7 +208,8 @@ def pedido_elegivel_tarefas(codigo_status) -> bool:
 def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) -> tuple[list[dict], list]:
     """
     Consulta, em paralelo, as tarefas geradas (endpoint tasks/list) para uma lista de pedidos.
-    Retorna uma lista "achatada" com uma linha por tarefa (já com o status traduzido).
+    Retorna uma lista "achatada" com uma linha por tarefa (já com o status traduzido),
+    incluindo o usuário responsável e os horários de início/fim (para o ranking de colaboradores).
     """
     tarefas_flat, falhas = [], []
     total = len(lista_pedidos)
@@ -234,6 +238,9 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
                             "Qtd": tarefa.get("qty", 0),
                             "DeLoc": tarefa.get("fromloc", ""),
                             "ParaLoc": tarefa.get("toloc", ""),
+                            "UserKey": tarefa.get("userkey", ""),
+                            "StartTime": tarefa.get("starttime"),
+                            "EndTime": tarefa.get("endtime"),
                         }
                     )
             except requests.exceptions.RequestException:
@@ -244,6 +251,49 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
 
     barra.empty()
     return tarefas_flat, falhas
+
+
+def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    """
+    A partir das tarefas com status Concluído, monta o ranking dos colaboradores:
+    quantidade de tarefas separadas, tempo médio de separação (EndTime - StartTime)
+    e a média de peças separadas por hora (soma de Qtd / soma de horas trabalhadas).
+    """
+    colunas_saida = ["Usuário", "Tarefas Concluídas", "Tempo Médio (min)", "Peças/Hora"]
+    if df_tarefas.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df = df_tarefas[df_tarefas["StatusCod"].astype(str).str.strip() == TASK_STATUS_CONCLUIDO].copy()
+    df = df[df["UserKey"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df["StartTime"] = pd.to_datetime(df["StartTime"], errors="coerce", utc=True)
+    df["EndTime"] = pd.to_datetime(df["EndTime"], errors="coerce", utc=True)
+    df["DuracaoMin"] = (df["EndTime"] - df["StartTime"]).dt.total_seconds() / 60
+    df = df[(df["DuracaoMin"] >= 0) & df["DuracaoMin"].notna()]
+    if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    resumo = (
+        df.groupby("UserKey")
+        .agg(
+            Tarefas_Concluidas=("UserKey", "count"),
+            Tempo_Medio_Min=("DuracaoMin", "mean"),
+            Total_Qtd=("Qtd", "sum"),
+            Total_Min=("DuracaoMin", "sum"),
+        )
+        .reset_index()
+    )
+    resumo["Total_Horas"] = resumo["Total_Min"] / 60
+    resumo["Peças/Hora"] = resumo.apply(
+        lambda r: round(r["Total_Qtd"] / r["Total_Horas"], 1) if r["Total_Horas"] > 0 else 0,
+        axis=1,
+    )
+    resumo["Tempo Médio (min)"] = resumo["Tempo_Medio_Min"].round(1)
+    resumo = resumo.rename(columns={"UserKey": "Usuário", "Tarefas_Concluidas": "Tarefas Concluídas"})
+    resumo = resumo[colunas_saida].sort_values("Tarefas Concluídas", ascending=False).head(top_n)
+    return resumo.reset_index(drop=True)
 
 
 # =========================================================
@@ -304,7 +354,10 @@ if consultar:
             )
             st.session_state["df_tarefas"] = (
                 pd.DataFrame(tarefas_flat) if tarefas_flat
-                else pd.DataFrame(columns=["Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd", "DeLoc", "ParaLoc"])
+                else pd.DataFrame(columns=[
+                    "Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd",
+                    "DeLoc", "ParaLoc", "UserKey", "StartTime", "EndTime",
+                ])
             )
             st.session_state["tarefas_falhas"] = tarefas_falhas
 
@@ -346,7 +399,10 @@ if "df_pedidos" in st.session_state:
 
     df_tarefas = st.session_state.get(
         "df_tarefas",
-        pd.DataFrame(columns=["Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd", "DeLoc", "ParaLoc"]),
+        pd.DataFrame(columns=[
+            "Pedido", "StatusCod", "Status", "TipoTarefa", "SKU", "Qtd",
+            "DeLoc", "ParaLoc", "UserKey", "StartTime", "EndTime",
+        ]),
     )
     tarefas_falhas = st.session_state.get("tarefas_falhas", [])
     total_tarefas = len(df_tarefas)
@@ -391,6 +447,45 @@ if "df_pedidos" in st.session_state:
         )
         fig_tarefas.update_layout(showlegend=False)
         st.plotly_chart(fig_tarefas, use_container_width=True)
+
+    # ---- Ranking de colaboradores (tarefas concluídas) ----
+    ranking = calcular_ranking_colaboradores(df_tarefas)
+    if not ranking.empty:
+        st.divider()
+        st.subheader("🏆 Top 10 Colaboradores - Tarefas Concluídas")
+
+        rc1, rc2 = st.columns(2)
+
+        with rc1:
+            fig_ranking = px.bar(
+                ranking.sort_values("Tarefas Concluídas"),
+                x="Tarefas Concluídas",
+                y="Usuário",
+                orientation="h",
+                text_auto=True,
+                title="Tarefas concluídas por colaborador",
+            )
+            fig_ranking.update_layout(showlegend=False)
+            st.plotly_chart(fig_ranking, use_container_width=True)
+
+        with rc2:
+            fig_pecas_hora = px.bar(
+                ranking.sort_values("Peças/Hora"),
+                x="Peças/Hora",
+                y="Usuário",
+                orientation="h",
+                text_auto=True,
+                title="Média de peças separadas por hora",
+            )
+            fig_pecas_hora.update_layout(showlegend=False)
+            st.plotly_chart(fig_pecas_hora, use_container_width=True)
+
+        st.dataframe(ranking, use_container_width=True, hide_index=True)
+        st.caption(
+            "Tempo médio calculado a partir de StartTime/EndTime das tarefas com status "
+            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
+            "Peças/Hora = soma de peças separadas ÷ soma de horas trabalhadas pelo colaborador."
+        )
 
     st.divider()
 
