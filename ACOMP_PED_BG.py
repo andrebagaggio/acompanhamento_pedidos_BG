@@ -23,7 +23,7 @@ CLIENT_SECRET = st.secrets["CS"]
 USERNAME = st.secrets["USERNAME"]
 PASSWORD = st.secrets["PASSWORD"]
 
-TOKEN_URL = st.secrets[TOKEN]
+TOKEN_URL = st.secrets["TOKEN"]
 WHSE_BASE_URL = (
     "https://mingle-ionapi.inforcloudsuite.com/US45PBYRE7XKA5QB_PRD/WM/wmwebservice_rest/"
     "US45PBYRE7XKA5QB_PRD_COBALTLIKABLECAT_PRD_SCE_PRD_4_wmwhse1"
