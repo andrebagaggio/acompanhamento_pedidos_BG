@@ -235,6 +235,8 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
             try:
                 tarefas = futuro.result()
                 for tarefa in tarefas:
+                    if tarefa.get("tasktype") != "PK":
+                        continue
                     codigo_status = tarefa.get("status", "")
                     tarefas_flat.append(
                         {
