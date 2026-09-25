@@ -18,10 +18,10 @@ import plotly.express as px
 # =========================================================
 # CONFIGURAÇÕES / CREDENCIAIS (fixas no código)
 # =========================================================
-CLIENT_ID = st.secrets[CI]
-CLIENT_SECRET = st.secrets[CS]
-USERNAME = st.secrets[USERNAME]
-PASSWORD = st.secrets[PASSWORD]
+CLIENT_ID = st.secrets["CI"]
+CLIENT_SECRET = st.secrets["CS"]
+USERNAME = st.secrets["USERNAME"]
+PASSWORD = st.secrets["PASSWORD"]
 
 TOKEN_URL = st.secrets[TOKEN]
 WHSE_BASE_URL = (
