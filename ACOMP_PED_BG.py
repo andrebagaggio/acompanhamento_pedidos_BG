@@ -38,9 +38,12 @@ TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
 # ---- Limites para manter o app leve com vários usuários simultâneos ----
 MAX_PEDIDOS_POR_CONSULTA = 500      # tamanho máximo de uma consulta (faixa ou lista)
 MAX_CONSULTAS_POR_USUARIO = 15      # teto do slider "Consultas simultâneas"
-MAX_REQUISICOES_GLOBAIS = 20        # teto de requisições em andamento somando TODOS os usuários
-CACHE_TTL_SEGUNDOS = 120            # por quanto tempo reaproveitar o resultado de um pedido
-CACHE_MAX_ITENS = 3000              # máximo de itens guardados em cada cache (limita memória)
+MAX_REQUISICOES_GLOBAIS = 12        # teto global conservador para evitar excesso no WMS/ION
+CACHE_TTL_SEGUNDOS = 180            # reaproveita resultados por 3 minutos
+CACHE_MAX_ITENS = 3000              # máximo de itens guardados em cada cache
+HTTP_CONNECT_TIMEOUT = 10           # timeout para estabelecer conexão
+HTTP_READ_TIMEOUT = 45              # timeout aguardando resposta do WMS
+TOKEN_TIMEOUT = 30                  # timeout da autenticação
 
 # A partir deste status (inclusive) o pedido já possui tarefas geradas no WMS
 STATUS_MIN_TAREFAS = 29
@@ -165,9 +168,13 @@ def criar_sessao() -> requests.Session:
     """Sessão HTTP com pool de conexões reaproveitadas e retry com backoff em 429/5xx."""
     retry = Retry(
         total=3,
+        connect=3,
+        read=3,
+        status=3,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "POST"}),  # o POST de tasks/list é só consulta
+        allowed_methods=frozenset({"GET", "POST"}),  # o POST de tasks/list é somente consulta
+        respect_retry_after_header=True,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(
@@ -197,9 +204,15 @@ def get_recursos() -> Recursos:
 # =========================================================
 # FUNÇÕES DE APOIO
 # =========================================================
-@st.cache_data(ttl=1500, show_spinner=False)
+@st.cache_data(ttl=3300, show_spinner=False)
 def get_token() -> str:
-    """Obtém (e mantém em cache por ~25min, compartilhado entre usuários) o token OAuth2."""
+    """
+    Obtém e mantém o token OAuth2 em cache.
+
+    O TTL de segurança é de 55 minutos. Caso o endpoint informe uma
+    validade menor, o valor retornado ainda continua válido para o fluxo
+    atual; caso informe validade maior, não ultrapassamos o TTL seguro.
+    """
     payload = {
         "grant_type": "password",
         "client_id": CLIENT_ID,
@@ -207,16 +220,66 @@ def get_token() -> str:
         "username": USERNAME,
         "password": PASSWORD,
     }
-    response = requests.post(TOKEN_URL, data=payload, timeout=30)
+
+    response = requests.post(
+        TOKEN_URL,
+        data=payload,
+        timeout=TOKEN_TIMEOUT,
+    )
     response.raise_for_status()
-    return response.json()["access_token"]
+
+    dados = response.json()
+    token = dados.get("access_token")
+    if not token:
+        raise requests.exceptions.HTTPError(
+            "O endpoint de autenticação não retornou access_token."
+        )
+
+    return token
 
 
-def _requisitar(recursos: Recursos, metodo: str, url: str, token: str, **kwargs) -> requests.Response:
-    """Faz a requisição respeitando o teto global de requisições simultâneas."""
-    headers = {"Authorization": f"Bearer {token}"}
-    with recursos.limitador:
-        return recursos.sessao.request(metodo, url, headers=headers, timeout=30, **kwargs)
+def _requisitar(
+    recursos: Recursos,
+    metodo: str,
+    url: str,
+    token: str,
+    renovar_token_em_401: bool = True,
+    **kwargs,
+) -> requests.Response:
+    """
+    Faz a requisição respeitando o teto global de chamadas.
+
+    Se o token expirar antes do TTL do cache, invalida o token em cache,
+    obtém um novo e repete a requisição uma única vez.
+    """
+    timeout = kwargs.pop(
+        "timeout",
+        (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
+    )
+
+    def enviar(token_atual: str) -> requests.Response:
+        headers = {"Authorization": f"Bearer {token_atual}"}
+        with recursos.limitador:
+            return recursos.sessao.request(
+                metodo,
+                url,
+                headers=headers,
+                timeout=timeout,
+                **kwargs,
+            )
+
+    resposta = enviar(token)
+
+    if resposta.status_code == 401 and renovar_token_em_401:
+        try:
+            get_token.clear()
+            novo_token = get_token()
+            resposta = enviar(novo_token)
+        except Exception:
+            # Mantém a resposta original se a renovação também falhar.
+            pass
+
+    return resposta
 
 
 def consulta_wms(pedido, token: str, recursos: Recursos) -> dict | None:
@@ -301,7 +364,18 @@ def consultar_pedidos(
     - falhas: erros reais de comunicação/API, mesmo após as tentativas automáticas
     """
     resultados, nao_encontrados, falhas = [], [], []
+
+    # Evita consultar duas vezes o mesmo pedido na mesma execução.
+    lista_pedidos = list(dict.fromkeys(str(p).strip() for p in lista_pedidos if str(p).strip()))
     total = len(lista_pedidos)
+
+    if total == 0:
+        return resultados, nao_encontrados, falhas
+
+    # Um paralelismo moderado tende a ser mais estável no Streamlit Cloud
+    # e ainda aproveita as chamadas concorrentes permitidas pelo WMS.
+    max_workers = max(1, min(int(max_workers), MAX_CONSULTAS_POR_USUARIO, MAX_REQUISICOES_GLOBAIS))
+
     concluidos = 0
     barra = st.progress(0.0, text="Consultando pedidos...")
 
@@ -356,9 +430,14 @@ def consultar_tarefas(
     motivos e na classificação de pedidos por localização.
     """
     tarefas_flat, falhas = [], []
+
+    # Evita chamadas duplicadas ao endpoint tasks/list.
+    lista_pedidos = list(dict.fromkeys(str(p).strip() for p in lista_pedidos if str(p).strip()))
     total = len(lista_pedidos)
     if total == 0:
         return tarefas_flat, falhas
+
+    max_workers = max(1, min(int(max_workers), MAX_CONSULTAS_POR_USUARIO, MAX_REQUISICOES_GLOBAIS))
 
     concluidos = 0
     barra = st.progress(0.0, text="Consultando tarefas geradas...")
@@ -517,7 +596,7 @@ def limpar_resultados():
 # INTERFACE
 # =========================================================
 st.title("📦 Acompanhamento De Demandas - Infor WMS")
-st.caption("Consulta de pedidos (shipments) via API REST do Infor WMS")
+st.caption("Consulta de pedidos (shipments) via API REST do Infor WMS • otimizado para Streamlit Cloud")
 
 with st.sidebar:
     st.header("Filtros de consulta")
@@ -539,7 +618,7 @@ with st.sidebar:
 
         paralelismo = st.slider(
             "Consultas simultâneas", min_value=1, max_value=MAX_CONSULTAS_POR_USUARIO, value=8,
-            help="Número de requisições feitas em paralelo por consulta.",
+            help="Número de requisições feitas em paralelo. O app também aplica um limite global para proteger o WMS/ION.",
         )
 
         consultar = st.form_submit_button("🔍 Consultar", use_container_width=True)
@@ -588,7 +667,11 @@ if consultar:
 
             # Pedidos com status >= 29 já geraram tarefas no WMS
             pedidos_elegiveis = sorted(
-                {r["Pedido"] for r in resultados if pedido_elegivel_tarefas(r["StatusCod"])}
+                {
+                    str(r["Pedido"])
+                    for r in resultados
+                    if pedido_elegivel_tarefas(r["StatusCod"])
+                }
             )
             tarefas_flat, tarefas_falhas = consultar_tarefas(
                 pedidos_elegiveis, token, recursos, max_workers=paralelismo
