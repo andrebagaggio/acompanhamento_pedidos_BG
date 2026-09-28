@@ -36,7 +36,7 @@ BASE_URL = f"{WHSE_BASE_URL}/shipments"
 TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
 
 # ---- Limites para manter o app leve com vários usuários simultâneos ----
-MAX_PEDIDOS_POR_CONSULTA = 500      # tamanho máximo de uma consulta (faixa ou lista)
+MAX_PEDIDOS_POR_CONSULTA = 1000      # tamanho máximo de uma consulta (faixa ou lista)
 MAX_CONSULTAS_POR_USUARIO = 15      # teto do slider "Consultas simultâneas"
 MAX_REQUISICOES_GLOBAIS = 12        # teto global conservador para evitar excesso no WMS/ION
 CACHE_TTL_SEGUNDOS = 180            # reaproveita resultados por 3 minutos
