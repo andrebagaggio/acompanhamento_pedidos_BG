@@ -737,6 +737,12 @@ if "df_pedidos" in st.session_state:
 
     with g1:
         st.subheader("Peças por Status")
+        df_status = (
+            df_filtrado
+            .groupby("Status", as_index=False)["Peças"]
+            .sum()
+            .sort_values("Peças", ascending=False)
+        )
         fig_bar = px.bar(
             df_filtrado.groupby("Status", as_index=False)["Peças"].sum(),
             x="Status",
