@@ -8,15 +8,19 @@ Modo mais on time possivel, posso usar na bag tmb
 """
 
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =========================================================
-# CONFIGURAÇÕES / CREDENCIAIS (fixas no código)
+# CONFIGURAÇÕES / CREDENCIAIS (via st.secrets)
 # =========================================================
 CLIENT_ID = st.secrets["CI"]
 CLIENT_SECRET = st.secrets["CS"]
@@ -30,6 +34,13 @@ WHSE_BASE_URL = (
 )
 BASE_URL = f"{WHSE_BASE_URL}/shipments"
 TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
+
+# ---- Limites para manter o app leve com vários usuários simultâneos ----
+MAX_PEDIDOS_POR_CONSULTA = 500      # tamanho máximo de uma consulta (faixa ou lista)
+MAX_CONSULTAS_POR_USUARIO = 15      # teto do slider "Consultas simultâneas"
+MAX_REQUISICOES_GLOBAIS = 20        # teto de requisições em andamento somando TODOS os usuários
+CACHE_TTL_SEGUNDOS = 120            # por quanto tempo reaproveitar o resultado de um pedido
+CACHE_MAX_ITENS = 3000              # máximo de itens guardados em cada cache (limita memória)
 
 # A partir deste status (inclusive) o pedido já possui tarefas geradas no WMS
 STATUS_MIN_TAREFAS = 29
@@ -118,11 +129,77 @@ st.set_page_config(
 
 
 # =========================================================
+# RECURSOS COMPARTILHADOS ENTRE TODAS AS SESSÕES
+# (sessão HTTP com retry, limitador global de requisições e caches)
+# =========================================================
+class CacheTTL:
+    """Cache simples em memória, com expiração e limite de itens, seguro para uso com threads."""
+
+    def __init__(self, ttl: int, max_itens: int):
+        self.ttl = ttl
+        self.max_itens = max_itens
+        self._dados: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, chave):
+        """Retorna (achou, valor)."""
+        with self._lock:
+            item = self._dados.get(chave)
+            if item is None:
+                return False, None
+            expira_em, valor = item
+            if expira_em < time.monotonic():
+                del self._dados[chave]
+                return False, None
+            return True, valor
+
+    def set(self, chave, valor):
+        with self._lock:
+            self._dados.pop(chave, None)
+            self._dados[chave] = (time.monotonic() + self.ttl, valor)
+            while len(self._dados) > self.max_itens:
+                self._dados.pop(next(iter(self._dados)))  # remove o mais antigo
+
+
+def criar_sessao() -> requests.Session:
+    """Sessão HTTP com pool de conexões reaproveitadas e retry com backoff em 429/5xx."""
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),  # o POST de tasks/list é só consulta
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=4,
+        pool_maxsize=MAX_REQUISICOES_GLOBAIS,
+    )
+    sessao = requests.Session()
+    sessao.mount("https://", adapter)
+    return sessao
+
+
+class Recursos:
+    def __init__(self):
+        self.sessao = criar_sessao()
+        self.limitador = threading.BoundedSemaphore(MAX_REQUISICOES_GLOBAIS)
+        self.cache_pedidos = CacheTTL(CACHE_TTL_SEGUNDOS, CACHE_MAX_ITENS)
+        self.cache_tarefas = CacheTTL(CACHE_TTL_SEGUNDOS, CACHE_MAX_ITENS)
+
+
+@st.cache_resource
+def get_recursos() -> Recursos:
+    """Um único conjunto de recursos para o app inteiro (compartilhado entre os usuários)."""
+    return Recursos()
+
+
+# =========================================================
 # FUNÇÕES DE APOIO
 # =========================================================
 @st.cache_data(ttl=1500, show_spinner=False)
 def get_token() -> str:
-    """Obtém (e mantém em cache por ~25min) o token OAuth2."""
+    """Obtém (e mantém em cache por ~25min, compartilhado entre usuários) o token OAuth2."""
     payload = {
         "grant_type": "password",
         "client_id": CLIENT_ID,
@@ -135,55 +212,121 @@ def get_token() -> str:
     return response.json()["access_token"]
 
 
-def consulta_wms(pedido: int, token: str) -> dict:
-    """Consulta um único pedido (shipment) no WMS."""
-    url = f"{BASE_URL}/{pedido}"
+def _requisitar(recursos: Recursos, metodo: str, url: str, token: str, **kwargs) -> requests.Response:
+    """Faz a requisição respeitando o teto global de requisições simultâneas."""
     headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    with recursos.limitador:
+        return recursos.sessao.request(metodo, url, headers=headers, timeout=30, **kwargs)
+
+
+def consulta_wms(pedido, token: str, recursos: Recursos) -> dict | None:
+    """
+    Consulta um único pedido (shipment) no WMS, com cache.
+    Retorna apenas os campos usados pelo app (economiza memória) ou None se o pedido não existir (404).
+    """
+    chave = str(pedido)
+    achou, valor = recursos.cache_pedidos.get(chave)
+    if achou:
+        return valor
+
+    resposta = _requisitar(recursos, "GET", f"{BASE_URL}/{pedido}", token)
+    if resposta.status_code == 404:
+        valor = None
+    else:
+        resposta.raise_for_status()
+        dados = resposta.json()
+        valor = {
+            "orderkey": dados.get("orderkey", pedido),
+            "status": dados.get("status", ""),
+            "totalqty": dados.get("totalqty", 0),
+            "ext_udf_str4": dados.get("ext_udf_str4", ""),
+        }
+
+    recursos.cache_pedidos.set(chave, valor)
+    return valor
+
+
+def consulta_tasks(pedido, token: str, recursos: Recursos) -> list[dict]:
+    """
+    Consulta as tarefas geradas (WMS) para um pedido, via POST, com cache.
+    Guarda apenas os campos usados pelo app (economiza memória).
+    """
+    chave = str(pedido)
+    achou, valor = recursos.cache_tarefas.get(chave)
+    if achou:
+        return valor
+
+    resposta = _requisitar(recursos, "POST", TASKS_URL, token, json={"orderkey": chave})
+    resposta.raise_for_status()
+    dados = resposta.json()
+    dados = dados if isinstance(dados, list) else []
+
+    valor = [
+        {
+            "status": t.get("status", ""),
+            "tasktype": t.get("tasktype", ""),
+            "sku": t.get("sku", ""),
+            "qty": t.get("qty", 0),
+            "fromloc": t.get("fromloc", ""),
+            "toloc": t.get("toloc", ""),
+            "userkey": t.get("userkey", ""),
+            "starttime": t.get("starttime"),
+            "endtime": t.get("endtime"),
+            "reasonkey": t.get("reasonkey", ""),
+        }
+        for t in dados
+    ]
+    recursos.cache_tarefas.set(chave, valor)
+    return valor
 
 
 def parse_lista_or(texto: str) -> list[str]:
     """
-    Converte uma string como 'pedido1 or pedido2 OR pedido3' em uma lista de pedidos.
+    Converte uma string como 'pedido1 or pedido2 OR pedido3' em uma lista de pedidos (sem repetidos).
     A separação por 'or' não diferencia maiúsculas/minúsculas (or, OR, Or, oR...).
     """
     if not texto or not texto.strip():
         return []
     partes = re.split(r"\s*\bor\b\s*", texto.strip(), flags=re.IGNORECASE)
-    return [p.strip() for p in partes if p.strip()]
+    return list(dict.fromkeys(p.strip() for p in partes if p.strip()))
 
 
-def consultar_pedidos(lista_pedidos: list, token: str, max_workers: int = 10) -> tuple[list[dict], list]:
+def consultar_pedidos(
+    lista_pedidos: list, token: str, recursos: Recursos, max_workers: int = 8
+) -> tuple[list[dict], list, list]:
     """
     Consulta uma lista de pedidos (faixa ou lista avulsa) em paralelo, via thread pool.
-    Como o gargalo é a latência de rede (I/O), paralelizar acelera bastante sem pesar
-    no processamento — cada consulta HTTP roda em sua própria thread.
-    Erros pontuais não interrompem as demais consultas.
+    Retorna (resultados, nao_encontrados, falhas):
+    - nao_encontrados: números que não existem no WMS (404)
+    - falhas: erros reais de comunicação/API, mesmo após as tentativas automáticas
     """
-    resultados, falhas = [], []
+    resultados, nao_encontrados, falhas = [], [], []
     total = len(lista_pedidos)
     concluidos = 0
     barra = st.progress(0.0, text="Consultando pedidos...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futuros = {executor.submit(consulta_wms, pedido, token): pedido for pedido in lista_pedidos}
+        futuros = {
+            executor.submit(consulta_wms, pedido, token, recursos): pedido for pedido in lista_pedidos
+        }
 
         for futuro in as_completed(futuros):
             pedido = futuros[futuro]
             try:
                 dados = futuro.result()
-                codigo_status = dados.get("status", "")
-                resultados.append(
-                    {
-                        "Pedido": dados.get("orderkey", pedido),
-                        "StatusCod": codigo_status,
-                        "Status": traduzir_status(codigo_status),
-                        "Peças": dados.get("totalqty", 0),
-                        "MensagemNota": dados.get("ext_udf_str4", ""),
-                    }
-                )
+                if dados is None:
+                    nao_encontrados.append(pedido)
+                else:
+                    codigo_status = dados["status"]
+                    resultados.append(
+                        {
+                            "Pedido": dados["orderkey"],
+                            "StatusCod": codigo_status,
+                            "Status": traduzir_status(codigo_status),
+                            "Peças": dados["totalqty"],
+                            "MensagemNota": dados["ext_udf_str4"],
+                        }
+                    )
             except requests.exceptions.RequestException:
                 falhas.append(pedido)
 
@@ -191,16 +334,7 @@ def consultar_pedidos(lista_pedidos: list, token: str, max_workers: int = 10) ->
             barra.progress(concluidos / total, text=f"Consultando pedidos... ({concluidos}/{total})")
 
     barra.empty()
-    return resultados, falhas
-
-
-def consulta_tasks(pedido, token) -> list:
-    """Consulta as tarefas geradas (WMS) para um pedido, via POST."""
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.post(TASKS_URL, headers=headers, json={"orderkey": str(pedido)}, timeout=30)
-    response.raise_for_status()
-    dados = response.json()
-    return dados if isinstance(dados, list) else []
+    return resultados, nao_encontrados, falhas
 
 
 def pedido_elegivel_tarefas(codigo_status) -> bool:
@@ -211,7 +345,9 @@ def pedido_elegivel_tarefas(codigo_status) -> bool:
         return False
 
 
-def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) -> tuple[list[dict], list]:
+def consultar_tarefas(
+    lista_pedidos: list, token: str, recursos: Recursos, max_workers: int = 8
+) -> tuple[list[dict], list]:
     """
     Consulta, em paralelo, as tarefas geradas (endpoint tasks/list) para uma lista de pedidos.
     Retorna uma lista "achatada" com uma linha por tarefa (já com o status traduzido),
@@ -228,30 +364,29 @@ def consultar_tarefas(lista_pedidos: list, token: str, max_workers: int = 10) ->
     barra = st.progress(0.0, text="Consultando tarefas geradas...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futuros = {executor.submit(consulta_tasks, pedido, token): pedido for pedido in lista_pedidos}
+        futuros = {
+            executor.submit(consulta_tasks, pedido, token, recursos): pedido for pedido in lista_pedidos
+        }
 
         for futuro in as_completed(futuros):
             pedido = futuros[futuro]
             try:
-                tarefas = futuro.result()
-                for tarefa in tarefas:
-                    if tarefa.get("tasktype") != "PK":
-                        continue
-                    codigo_status = tarefa.get("status", "")
+                for tarefa in futuro.result():
+                    codigo_status = tarefa["status"]
                     tarefas_flat.append(
                         {
                             "Pedido": pedido,
                             "StatusCod": codigo_status,
                             "Status": traduzir_status_tarefa(codigo_status),
-                            "TipoTarefa": tarefa.get("tasktype", ""),
-                            "SKU": tarefa.get("sku", ""),
-                            "Qtd": tarefa.get("qty", 0),
-                            "DeLoc": tarefa.get("fromloc", ""),
-                            "ParaLoc": tarefa.get("toloc", ""),
-                            "UserKey": tarefa.get("userkey", ""),
-                            "StartTime": tarefa.get("starttime"),
-                            "EndTime": tarefa.get("endtime"),
-                            "ReasonCod": tarefa.get("reasonkey", ""),
+                            "TipoTarefa": tarefa["tasktype"],
+                            "SKU": tarefa["sku"],
+                            "Qtd": tarefa["qty"],
+                            "DeLoc": tarefa["fromloc"],
+                            "ParaLoc": tarefa["toloc"],
+                            "UserKey": tarefa["userkey"],
+                            "StartTime": tarefa["starttime"],
+                            "EndTime": tarefa["endtime"],
+                            "ReasonCod": tarefa["reasonkey"],
                         }
                     )
             except requests.exceptions.RequestException:
@@ -330,7 +465,7 @@ def classificar_localizacao(fromloc) -> str:
     termina em '000' ou '010' -> Baixo; termina em '020' -> Médio; demais -> Alto.
     """
     loc = str(fromloc).strip()
-    if loc.endswith("000") or loc.endswith("010") or loc.endswith("01") or loc.endswith("02") or loc.endswith("03") or loc.endswith("04") or loc.endswith("05") or loc.endswith("06"):
+    if loc.endswith("000") or loc.endswith("010"):
         return "Baixo"
     if loc.endswith("020"):
         return "Médio"
@@ -372,6 +507,12 @@ def classificar_pedidos_por_localizacao(df_tarefas: pd.DataFrame) -> pd.DataFram
     return resumo
 
 
+def limpar_resultados():
+    """Remove do session_state os resultados de uma consulta anterior."""
+    for chave in ("df_pedidos", "falhas", "nao_encontrados", "df_tarefas", "tarefas_falhas"):
+        st.session_state.pop(chave, None)
+
+
 # =========================================================
 # INTERFACE
 # =========================================================
@@ -380,28 +521,37 @@ st.caption("Consulta de pedidos (shipments) via API REST do Infor WMS")
 
 with st.sidebar:
     st.header("Filtros de consulta")
+
+    # O tipo de busca fica fora do formulário para trocar os campos abaixo imediatamente
     modo_busca = st.radio("Tipo de busca", ["Faixa de pedidos", "Lista de pedidos (OR)"])
 
-    if modo_busca == "Faixa de pedidos":
-        inicio = st.number_input("Pedido inicial", min_value=1, step=1)
-        fim = st.number_input("Pedido final", min_value=int(inicio), step=1, value=int(inicio))
-    else:
-        texto_pedidos = st.text_area(
-            "Pedidos",
-            placeholder="pedido1 or pedido2 or pedido3",
-            help="Separe os pedidos com 'or' (não diferencia maiúsculas/minúsculas: or, OR, Or...).",
+    # Dentro do formulário, a consulta só roda ao clicar em "Consultar" (evita reruns a cada digitação)
+    with st.form("form_consulta"):
+        if modo_busca == "Faixa de pedidos":
+            inicio = st.number_input("Pedido inicial", min_value=1, step=1)
+            fim = st.number_input("Pedido final", min_value=1, step=1)
+        else:
+            texto_pedidos = st.text_area(
+                "Pedidos",
+                placeholder="pedido1 or pedido2 or pedido3",
+                help="Separe os pedidos com 'or' (não diferencia maiúsculas/minúsculas: or, OR, Or...).",
+            )
+
+        paralelismo = st.slider(
+            "Consultas simultâneas", min_value=1, max_value=MAX_CONSULTAS_POR_USUARIO, value=8,
+            help="Número de requisições feitas em paralelo por consulta.",
         )
 
-    paralelismo = st.slider(
-        "Consultas simultâneas", min_value=1, max_value=30, value=10,
-        help="Número de requisições feitas em paralelo. Valores maiores aceleram a consulta.",
-    )
+        consultar = st.form_submit_button("🔍 Consultar", use_container_width=True)
 
-    consultar = st.button("🔍 Consultar", use_container_width=True)
+    st.caption(f"Limite de {MAX_PEDIDOS_POR_CONSULTA} pedidos por consulta.")
 
 if consultar:
     try:
         if modo_busca == "Faixa de pedidos":
+            if int(fim) < int(inicio):
+                st.warning("O pedido final deve ser maior ou igual ao pedido inicial.")
+                st.stop()
             lista_pedidos = list(range(int(inicio), int(fim) + 1))
         else:
             lista_pedidos = parse_lista_or(texto_pedidos)
@@ -409,24 +559,39 @@ if consultar:
                 st.warning("Informe ao menos um pedido, separado por 'or'.")
                 st.stop()
 
+        if len(lista_pedidos) > MAX_PEDIDOS_POR_CONSULTA:
+            st.warning(
+                f"A consulta tem {len(lista_pedidos)} pedidos. O limite é de "
+                f"{MAX_PEDIDOS_POR_CONSULTA} por consulta — reduza a faixa/lista."
+            )
+            st.stop()
+
+        recursos = get_recursos()
+
         with st.spinner("Autenticando..."):
             token = get_token()
 
-        resultados, falhas = consultar_pedidos(lista_pedidos, token, max_workers=paralelismo)
+        resultados, nao_encontrados, falhas = consultar_pedidos(
+            lista_pedidos, token, recursos, max_workers=paralelismo
+        )
 
         if not resultados:
-            st.warning("Nenhum pedido foi retornado para a faixa informada.")
+            limpar_resultados()
+            mensagem = "Nenhum pedido foi encontrado para a consulta informada."
+            if falhas:
+                mensagem += f" ({len(falhas)} pedido(s) tiveram erro de consulta.)"
+            st.warning(mensagem)
         else:
-            df = pd.DataFrame(resultados)
-            st.session_state["df_pedidos"] = df
+            st.session_state["df_pedidos"] = pd.DataFrame(resultados)
             st.session_state["falhas"] = falhas
+            st.session_state["nao_encontrados"] = nao_encontrados
 
             # Pedidos com status >= 29 já geraram tarefas no WMS
             pedidos_elegiveis = sorted(
                 {r["Pedido"] for r in resultados if pedido_elegivel_tarefas(r["StatusCod"])}
             )
             tarefas_flat, tarefas_falhas = consultar_tarefas(
-                pedidos_elegiveis, token, max_workers=paralelismo
+                pedidos_elegiveis, token, recursos, max_workers=paralelismo
             )
             st.session_state["df_tarefas"] = (
                 pd.DataFrame(tarefas_flat) if tarefas_flat else pd.DataFrame(columns=COLUNAS_TAREFAS)
@@ -444,14 +609,26 @@ if consultar:
 if "df_pedidos" in st.session_state:
     df = st.session_state["df_pedidos"]
     falhas = st.session_state.get("falhas", [])
+    nao_encontrados = st.session_state.get("nao_encontrados", [])
 
     if falhas:
-        st.warning(f"⚠️ {len(falhas)} pedido(s) não puderam ser consultados: {falhas}")
+        st.warning(f"⚠️ {len(falhas)} pedido(s) não puderam ser consultados (erro de comunicação/API): {falhas}")
+    if nao_encontrados:
+        with st.expander(f"ℹ️ {len(nao_encontrados)} número(s) sem pedido correspondente no WMS"):
+            st.write(sorted(nao_encontrados, key=str))
 
     # ---- Filtro por MensagemNota ----
     mensagens = ["Todos"] + sorted(df["MensagemNota"].dropna().unique().tolist())
     filtro = st.selectbox("Filtrar por Mensagem/Nota", mensagens)
     df_filtrado = df if filtro == "Todos" else df[df["MensagemNota"] == filtro]
+
+    # O filtro vale também para tarefas, rankings e classificação
+    pedidos_filtrados = set(df_filtrado["Pedido"].astype(str))
+    df_tarefas_todas = st.session_state.get("df_tarefas", pd.DataFrame(columns=COLUNAS_TAREFAS))
+    df_tarefas = df_tarefas_todas[df_tarefas_todas["Pedido"].astype(str).isin(pedidos_filtrados)]
+    tarefas_falhas = [
+        p for p in st.session_state.get("tarefas_falhas", []) if str(p) in pedidos_filtrados
+    ]
 
     st.divider()
 
@@ -468,11 +645,7 @@ if "df_pedidos" in st.session_state:
     col2.metric("📦 Total de Peças", f"{total_pecas:,}".replace(",", "."))
     col3.metric("📊 Média de Peças/Pedido", media_pecas)
     col4.metric("🏷️ Status Predominante", status_predominante)
-
-    df_tarefas = st.session_state.get("df_tarefas", pd.DataFrame(columns=COLUNAS_TAREFAS))
-    tarefas_falhas = st.session_state.get("tarefas_falhas", [])
-    total_tarefas = len(df_tarefas)
-    col5.metric("🗂️ Tarefas Geradas", total_tarefas)
+    col5.metric("🗂️ Tarefas Geradas", len(df_tarefas))
 
     st.divider()
 
@@ -549,7 +722,7 @@ if "df_pedidos" in st.session_state:
 
         st.dataframe(ranking, use_container_width=True, hide_index=True)
         st.caption(
-            "Tempo médio calculado a partir de Data Início/Data Fim das tarefas com status "
+            "Tempo médio calculado a partir de StartTime/EndTime das tarefas com status "
             f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
             "Peças/Hora = soma de peças separadas ÷ soma de horas trabalhadas pelo colaborador."
         )
@@ -576,7 +749,7 @@ if "df_pedidos" in st.session_state:
         st.divider()
         st.subheader("📍 Classificação dos Pedidos por Localização")
         st.caption(
-            "Baseado no no local de origem das tarefas: terminação 000/010 = Baixo, 020 = Médio, demais = Alto. "
+            "Baseado no fromloc das tarefas: terminação 000/010 = Baixo, 020 = Médio, demais = Alto. "
             "Pedidos com mais de uma faixa aparecem como parcial/misto."
         )
 
