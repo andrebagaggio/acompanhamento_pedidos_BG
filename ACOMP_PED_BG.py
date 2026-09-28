@@ -736,23 +736,26 @@ if "df_pedidos" in st.session_state:
     g1, g2 = st.columns(2)
 
     with g1:
-        st.subheader("Peças por Status")
-        df_status = (
-            df_filtrado
-            .groupby("Status", as_index=False)["Peças"]
-            .sum()
-            .sort_values("Peças", ascending=False)
-        )
-        fig_bar = px.bar(
-            df_filtrado.groupby("Status", as_index=False)["Peças"].sum(),
-            x="Status",
-            y="Peças",
-            color_discrete_sequence=["#1f77b4"],
-            text_auto=True,
-        )
-        fig_bar.update_layout(showlegend=False)
-        st.plotly_chart(fig_bar, use_container_width=True)
+    st.subheader("Peças por Status")
 
+    df_status = (
+        df_filtrado
+        .groupby("Status", as_index=False)["Peças"]
+        .sum()
+        .sort_values("Peças", ascending=False)
+    )
+
+    fig_bar = px.bar(
+        df_status,
+        x="Status",
+        y="Peças",
+        text_auto=True,
+    )
+
+    fig_bar.update_traces(marker_color="#1f77b4")
+    fig_bar.update_layout(showlegend=False)
+
+    st.plotly_chart(fig_bar, use_container_width=True)
     with g2:
         st.subheader("Distribuição de Pedidos por Status")
         fig_pie = px.pie(
