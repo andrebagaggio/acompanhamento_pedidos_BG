@@ -480,7 +480,7 @@ def consultar_tarefas(
 
 def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     """
-    A partir das tarefas com status Concluído (e sem motivo/reasoncode preenchido — essas
+    A partir das tarefas com status Concluído (e sem motivo preenchido — essas
     são desconsideradas do ranking), monta o ranking dos colaboradores: quantidade de
     tarefas separadas, tempo médio de separação (EndTime - StartTime) e a média de
     peças separadas por hora (soma de Qtd / soma de horas trabalhadas).
@@ -741,7 +741,7 @@ if "df_pedidos" in st.session_state:
             df_filtrado.groupby("Status", as_index=False)["Peças"].sum(),
             x="Status",
             y="Peças",
-            color="Status",
+            color=["#1f77b4"],
             text_auto=True,
         )
         fig_bar.update_layout(showlegend=False)
