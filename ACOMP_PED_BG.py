@@ -741,7 +741,7 @@ if "df_pedidos" in st.session_state:
             df_filtrado.groupby("Status", as_index=False)["Peças"].sum(),
             x="Status",
             y="Peças",
-            color="smoker",
+            color_discrete_sequence=["#1f77b4"],
             text_auto=True,
         )
         fig_bar.update_layout(showlegend=False)
