@@ -478,8 +478,35 @@ def consultar_tarefas(
     return tarefas_flat, falhas
 
 
-def calcular_ranking_colaboradores(df_tarefas: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
-    """
+# ---- Filtro de colaboradores para os rankings ----
+usuarios_disponiveis = sorted(
+    df_tarefas["UserKey"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .loc[lambda x: x != ""]
+    .unique()
+    .tolist()
+)
+
+usuarios_selecionados = st.multiselect(
+    "👤 Filtrar colaboradores dos rankings",
+    options=usuarios_disponiveis,
+    default=usuarios_disponiveis,
+    help="Selecione os colaboradores que deseja considerar nos rankings de tarefas concluídas e Peças/Hora."
+)
+
+if usuarios_selecionados:
+    df_tarefas_ranking = df_tarefas[
+        df_tarefas["UserKey"].astype(str).isin(usuarios_selecionados)
+    ].copy()
+else:
+    df_tarefas_ranking = pd.DataFrame(columns=df_tarefas.columns)
+
+# ---- Ranking de colaboradores (tarefas concluídas) ----
+ranking = calcular_ranking_colaboradores(df_tarefas_ranking)
+
+"""
     A partir das tarefas com status Concluído (e sem motivo preenchido — essas
     são desconsideradas do ranking), monta o ranking dos colaboradores: quantidade de
     tarefas separadas, tempo médio de separação (EndTime - StartTime) e a média de
@@ -704,6 +731,8 @@ if "df_pedidos" in st.session_state:
     mensagens = ["Todos"] + sorted(df["MensagemNota"].dropna().unique().tolist())
     filtro = st.selectbox("Filtrar por Mensagem/Nota", mensagens)
     df_filtrado = df if filtro == "Todos" else df[df["MensagemNota"] == filtro]
+
+    
 
     # O filtro vale também para tarefas, rankings e classificação
     pedidos_filtrados = set(df_filtrado["Pedido"].astype(str))
