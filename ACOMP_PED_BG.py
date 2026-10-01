@@ -1,4 +1,3 @@
-```python
 """
 Acompanhamento Gráfico - Infor WMS
 -----------------------------------
