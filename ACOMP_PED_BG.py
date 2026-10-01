@@ -478,33 +478,33 @@ def consultar_tarefas(
     return tarefas_flat, falhas
 
 
-# ---- Filtro de colaboradores para os rankings ----
-usuarios_disponiveis = sorted(
-    df_tarefas["UserKey"]
-    .dropna()
-    .astype(str)
-    .str.strip()
-    .loc[lambda x: x != ""]
-    .unique()
-    .tolist()
-)
-
-usuarios_selecionados = st.multiselect(
-    "👤 Filtrar colaboradores dos rankings",
-    options=usuarios_disponiveis,
-    default=usuarios_disponiveis,
-    help="Selecione os colaboradores que deseja considerar nos rankings de tarefas concluídas e Peças/Hora."
-)
-
-if usuarios_selecionados:
-    df_tarefas_ranking = df_tarefas[
-        df_tarefas["UserKey"].astype(str).isin(usuarios_selecionados)
-    ].copy()
-else:
-    df_tarefas_ranking = pd.DataFrame(columns=df_tarefas.columns)
-
-# ---- Ranking de colaboradores (tarefas concluídas) ----
-ranking = calcular_ranking_colaboradores(df_tarefas_ranking)
+    # ---- Filtro de colaboradores para os rankings ----
+    usuarios_disponiveis = sorted(
+        df_tarefas["UserKey"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .loc[lambda x: x != ""]
+        .unique()
+        .tolist()
+    )
+    
+    usuarios_selecionados = st.multiselect(
+        "👤 Filtrar colaboradores dos rankings",
+        options=usuarios_disponiveis,
+        default=usuarios_disponiveis,
+        help="Selecione os colaboradores que deseja considerar nos rankings de tarefas concluídas e Peças/Hora."
+    )
+    
+    if usuarios_selecionados:
+        df_tarefas_ranking = df_tarefas[
+            df_tarefas["UserKey"].astype(str).isin(usuarios_selecionados)
+        ].copy()
+    else:
+        df_tarefas_ranking = pd.DataFrame(columns=df_tarefas.columns)
+    
+    # ---- Ranking de colaboradores (tarefas concluídas) ----
+    ranking = calcular_ranking_colaboradores(df_tarefas_ranking)
 
 """
     A partir das tarefas com status Concluído (e sem motivo preenchido — essas
