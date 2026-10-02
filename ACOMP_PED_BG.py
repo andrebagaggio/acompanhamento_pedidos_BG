@@ -62,6 +62,9 @@ STATUS_MIN_TAREFAS = 29
 # Status de tarefa considerado concluído
 TASK_STATUS_CONCLUIDO = "9"
 
+# Fuso horário usado para exibir o acompanhamento hora a hora
+FUSO_HORARIO = "America/Sao_Paulo"
+
 
 # =========================================================
 # COLUNAS DAS TAREFAS
@@ -1035,6 +1038,57 @@ def classificar_pedidos_por_localizacao(
 
 
 # =========================================================
+# ACOMPANHAMENTO HORA A HORA (TAREFAS)
+# =========================================================
+
+def calcular_tarefas_hora_a_hora(
+    df_tarefas: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Agrupa as tarefas CONCLUÍDAS por hora (com base no EndTime, convertido
+    para o fuso de FUSO_HORARIO), somando a quantidade de tarefas concluídas
+    e de peças separadas em cada hora — serve para ver o ritmo de separação
+    ao longo do dia/turno.
+    """
+
+    colunas_saida = ["HoraOrdenacao", "Hora", "Tarefas Concluídas", "Peças"]
+
+    if df_tarefas.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df = df_tarefas[
+        df_tarefas["StatusCod"].astype(str).str.strip() == TASK_STATUS_CONCLUIDO
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df["EndTime"] = pd.to_datetime(df["EndTime"], errors="coerce", utc=True)
+    df = df[df["EndTime"].notna()]
+
+    if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    df["EndTime"] = df["EndTime"].dt.tz_convert(FUSO_HORARIO)
+    df["HoraOrdenacao"] = df["EndTime"].dt.floor("h")
+
+    resumo = (
+        df.groupby("HoraOrdenacao")
+        .agg(
+            **{
+                "Tarefas Concluídas": ("HoraOrdenacao", "count"),
+                "Peças": ("Qtd", "sum"),
+            }
+        )
+        .reset_index()
+        .sort_values("HoraOrdenacao")
+    )
+
+    resumo["Hora"] = resumo["HoraOrdenacao"].dt.strftime("%d/%m %Hh")
+    return resumo[colunas_saida]
+
+
+# =========================================================
 # LIMPAR RESULTADOS
 # =========================================================
 
@@ -1412,6 +1466,89 @@ if "df_pedidos" in st.session_state:
 
 
     # =====================================================
+    # FILTRO DE COLABORADORES
+    # (aplicado a TODOS os gráficos/tabelas de tarefas abaixo,
+    #  junto com o filtro de Mensagem/Nota já aplicado acima)
+    # =====================================================
+
+    if not df_tarefas.empty:
+
+        usuarios_disponiveis = sorted(
+
+            df_tarefas[
+                "UserKey"
+            ]
+
+            .dropna()
+
+            .astype(str)
+
+            .str.strip()
+
+            .loc[
+                lambda x: x != ""
+            ]
+
+            .unique()
+
+            .tolist()
+        )
+
+        usuarios_selecionados = (
+            st.multiselect(
+
+                "👤 Filtrar colaboradores "
+                "(tarefas, rankings e hora a hora)",
+
+                options=usuarios_disponiveis,
+
+                default=usuarios_disponiveis,
+
+                help=(
+                    "Esse filtro afeta todos os gráficos e tabelas "
+                    "da seção de tarefas abaixo: status, hora a hora, "
+                    "ranking de colaboradores, ranking de motivos e "
+                    "classificação por localização."
+                ),
+            )
+        )
+
+        if usuarios_selecionados:
+
+            df_tarefas_filtrado = (
+                df_tarefas[
+                    df_tarefas[
+                        "UserKey"
+                    ]
+                    .astype(str)
+                    .isin(
+                        usuarios_selecionados
+                    )
+                ].copy()
+            )
+
+        else:
+
+            df_tarefas_filtrado = (
+                pd.DataFrame(
+                    columns=df_tarefas.columns
+                )
+            )
+
+    else:
+
+        usuarios_disponiveis = []
+
+        usuarios_selecionados = []
+
+        df_tarefas_filtrado = (
+            pd.DataFrame(
+                columns=COLUNAS_TAREFAS
+            )
+        )
+
+
+    # =====================================================
     # INDICADORES
     # =====================================================
 
@@ -1484,12 +1621,15 @@ if "df_pedidos" in st.session_state:
 
     col5.metric(
         "🗂️ Tarefas Geradas",
-        len(df_tarefas)
+        len(df_tarefas_filtrado)
     )
 
 
     # =====================================================
-    # GRÁFICOS
+    # GRÁFICOS DOS PEDIDOS
+    # (nível pedido — seguem o filtro de Mensagem/Nota;
+    #  o filtro de colaboradores não se aplica aqui, pois é
+    #  um conceito de tarefa, não de pedido)
     # =====================================================
 
     st.divider()
@@ -1569,16 +1709,17 @@ if "df_pedidos" in st.session_state:
 
     # =====================================================
     # TAREFAS POR STATUS
+    # (já considera Mensagem/Nota + colaboradores)
     # =====================================================
 
-    if not df_tarefas.empty:
+    if not df_tarefas_filtrado.empty:
 
         st.subheader(
             "Tarefas por Status"
         )
 
         contagem_tarefas = (
-            df_tarefas[
+            df_tarefas_filtrado[
                 "Status"
             ]
             .value_counts()
@@ -1609,82 +1750,82 @@ if "df_pedidos" in st.session_state:
 
 
     # =====================================================
-    # FILTRO DE COLABORADORES
+    # ACOMPANHAMENTO HORA A HORA (TAREFAS)
     # =====================================================
 
-    if not df_tarefas.empty:
+    hora_a_hora = calcular_tarefas_hora_a_hora(
+        df_tarefas_filtrado
+    )
 
-        usuarios_disponiveis = sorted(
+    if not hora_a_hora.empty:
 
-            df_tarefas[
-                "UserKey"
-            ]
+        st.divider()
 
-            .dropna()
-
-            .astype(str)
-
-            .str.strip()
-
-            .loc[
-                lambda x: x != ""
-            ]
-
-            .unique()
-
-            .tolist()
+        st.subheader(
+            "⏱️ Acompanhamento Hora a Hora (Tarefas Concluídas)"
         )
 
-        usuarios_selecionados = (
-            st.multiselect(
-
-                "👤 Filtrar colaboradores "
-                "dos rankings",
-
-                options=usuarios_disponiveis,
-
-                default=usuarios_disponiveis,
-
-                help=(
-                    "Esse filtro afeta somente "
-                    "o ranking de tarefas concluídas, "
-                    "tempo médio e Peças/Hora."
-                ),
-            )
+        st.caption(
+            f"Baseado no horário de conclusão (EndTime) das tarefas, "
+            f"no fuso {FUSO_HORARIO}. Considera o status "
+            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}' e já "
+            "respeita os filtros de Mensagem/Nota e de colaboradores."
         )
 
-        if usuarios_selecionados:
+        hh1, hh2 = st.columns(2)
 
-            df_tarefas_ranking = (
-                df_tarefas[
-                    df_tarefas[
-                        "UserKey"
-                    ]
-                    .astype(str)
-                    .isin(
-                        usuarios_selecionados
-                    )
-                ].copy()
+        with hh1:
+
+            fig_hh_tarefas = px.bar(
+                hora_a_hora,
+                x="Hora",
+                y="Tarefas Concluídas",
+                text_auto=True,
+                title="Tarefas concluídas por hora",
             )
 
-        else:
-
-            df_tarefas_ranking = (
-                pd.DataFrame(
-                    columns=df_tarefas.columns
-                )
+            fig_hh_tarefas.update_traces(
+                marker_color="#1f77b4"
             )
 
-    else:
-
-        usuarios_disponiveis = []
-
-        usuarios_selecionados = []
-
-        df_tarefas_ranking = (
-            pd.DataFrame(
-                columns=df_tarefas.columns
+            fig_hh_tarefas.update_layout(
+                showlegend=False,
+                xaxis_title=None,
             )
+
+            st.plotly_chart(
+                fig_hh_tarefas,
+                use_container_width=True
+            )
+
+        with hh2:
+
+            fig_hh_pecas = px.bar(
+                hora_a_hora,
+                x="Hora",
+                y="Peças",
+                text_auto=True,
+                title="Peças separadas por hora",
+            )
+
+            fig_hh_pecas.update_traces(
+                marker_color="#2ca02c"
+            )
+
+            fig_hh_pecas.update_layout(
+                showlegend=False,
+                xaxis_title=None,
+            )
+
+            st.plotly_chart(
+                fig_hh_pecas,
+                use_container_width=True
+            )
+
+        st.dataframe(
+            hora_a_hora[["Hora", "Tarefas Concluídas", "Peças"]],
+            use_container_width=True,
+            hide_index=True,
         )
 
 
@@ -1694,7 +1835,7 @@ if "df_pedidos" in st.session_state:
 
     ranking = (
         calcular_ranking_colaboradores(
-            df_tarefas_ranking
+            df_tarefas_filtrado
         )
     )
 
@@ -1798,15 +1939,10 @@ if "df_pedidos" in st.session_state:
         )
 
         st.caption(
-
             "Tempo médio calculado a partir "
             "de StartTime/EndTime das tarefas "
             "com status "
-
-            f"'{traduzir_status_tarefa(
-                TASK_STATUS_CONCLUIDO
-            )}'. "
-
+            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
             "Peças/Hora = soma de peças separadas "
             "÷ soma de horas trabalhadas pelo "
             "colaborador."
@@ -1819,7 +1955,7 @@ if "df_pedidos" in st.session_state:
 
     ranking_motivos = (
         calcular_ranking_motivos(
-            df_tarefas
+            df_tarefas_filtrado
         )
     )
 
@@ -1868,7 +2004,7 @@ if "df_pedidos" in st.session_state:
 
     classificacao_pedidos = (
         classificar_pedidos_por_localizacao(
-            df_tarefas
+            df_tarefas_filtrado
         )
     )
 
@@ -1988,7 +2124,7 @@ if "df_pedidos" in st.session_state:
     # TAREFAS GERADAS
     # =====================================================
 
-    if not df_tarefas.empty:
+    if not df_tarefas_filtrado.empty:
 
         st.divider()
 
@@ -2010,7 +2146,7 @@ if "df_pedidos" in st.session_state:
 
         resumo_pedido = (
 
-            df_tarefas
+            df_tarefas_filtrado
 
             .groupby("Pedido")
 
@@ -2038,7 +2174,7 @@ if "df_pedidos" in st.session_state:
 
             st.dataframe(
 
-                df_tarefas,
+                df_tarefas_filtrado,
 
                 use_container_width=True,
 
