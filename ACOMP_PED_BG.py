@@ -1772,55 +1772,86 @@ if "df_pedidos" in st.session_state:
             "respeita os filtros de Mensagem/Nota e de colaboradores."
         )
 
-        hh1, hh2 = st.columns(2)
+        # =====================================================
+        # GRÁFICO 1 — TAREFAS CONCLUÍDAS POR HORA
+        # =====================================================
 
-        with hh1:
+        fig_hh_tarefas = px.bar(
+            hora_a_hora,
+            x="Hora",
+            y="Tarefas Concluídas",
+            text="Tarefas Concluídas",
+            title="Tarefas concluídas por hora",
+        )
 
-            fig_hh_tarefas = px.bar(
-                hora_a_hora,
-                x="Hora",
-                y="Tarefas Concluídas",
-                text_auto=True,
-                title="Tarefas concluídas por hora",
-            )
+        fig_hh_tarefas.update_traces(
+            marker_color="#1f77b4",
+            textposition="outside",
+            textfont=dict(size=16),
+            cliponaxis=False,
+        )
 
-            fig_hh_tarefas.update_traces(
-                marker_color="#1f77b4"
-            )
+        fig_hh_tarefas.update_layout(
+            showlegend=False,
+            xaxis_title=None,
+            yaxis_title="Tarefas concluídas",
+            height=450,
+            margin=dict(t=70, b=70, l=50, r=30),
+            xaxis=dict(
+                tickangle=0,
+                automargin=True,
+            ),
+            yaxis=dict(
+                rangemode="tozero",
+                automargin=True,
+            ),
+        )
 
-            fig_hh_tarefas.update_layout(
-                showlegend=False,
-                xaxis_title=None,
-            )
+        st.plotly_chart(
+            fig_hh_tarefas,
+            use_container_width=True
+        )
 
-            st.plotly_chart(
-                fig_hh_tarefas,
-                use_container_width=True
-            )
 
-        with hh2:
+        # =====================================================
+        # GRÁFICO 2 — PEÇAS SEPARADAS POR HORA
+        # =====================================================
 
-            fig_hh_pecas = px.bar(
-                hora_a_hora,
-                x="Hora",
-                y="Peças",
-                text_auto=True,
-                title="Peças separadas por hora",
-            )
+        fig_hh_pecas = px.bar(
+            hora_a_hora,
+            x="Hora",
+            y="Peças",
+            text="Peças",
+            title="Peças separadas por hora",
+        )
 
-            fig_hh_pecas.update_traces(
-                marker_color="#2ca02c"
-            )
+        fig_hh_pecas.update_traces(
+            marker_color="#2ca02c",
+            textposition="outside",
+            textfont=dict(size=16),
+            cliponaxis=False,
+        )
 
-            fig_hh_pecas.update_layout(
-                showlegend=False,
-                xaxis_title=None,
-            )
+        fig_hh_pecas.update_layout(
+            showlegend=False,
+            xaxis_title=None,
+            yaxis_title="Peças",
+            height=450,
+            margin=dict(t=70, b=70, l=50, r=30),
+            xaxis=dict(
+                tickangle=0,
+                automargin=True,
+            ),
+            yaxis=dict(
+                rangemode="tozero",
+                automargin=True,
+            ),
+        )
 
-            st.plotly_chart(
-                fig_hh_pecas,
-                use_container_width=True
-            )
+        st.plotly_chart(
+            fig_hh_pecas,
+            use_container_width=True
+        )
 
         st.dataframe(
             hora_a_hora[["Hora", "Tarefas Concluídas", "Peças"]],
