@@ -1,34 +1,26 @@
-"""
-Acompanhamento Gráfico - Infor WMS
------------------------------------
-App Streamlit para consultar uma faixa de pedidos no Infor WMS
-via API, exibir indicadores e gráficos de status.
-
-Modo mais on time possível, posso usar na bag também.
-"""
-
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 
-import requests
 import pandas as pd
-import streamlit as st
 import plotly.express as px
+import pyodbc
+import requests
+import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 # =========================================================
-# CONFIGURAÇÕES / CREDENCIAIS (via st.secrets)
+# CONFIGURAÇÕES / CREDENCIAIS
 # =========================================================
-
+# API INFOR
 CLIENT_ID = st.secrets["CI"]
 CLIENT_SECRET = st.secrets["CS"]
 USERNAME = st.secrets["USERNAME"]
 PASSWORD = st.secrets["PASSWORD"]
-
 TOKEN_URL = st.secrets["TOKEN"]
 
 WHSE_BASE_URL = (
@@ -40,35 +32,40 @@ WHSE_BASE_URL = (
 BASE_URL = f"{WHSE_BASE_URL}/shipments"
 TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
 
+# SQL SERVER
+SQL_SERVER = st.secrets["SQL_SERVER"]
+SQL_DATABASE = st.secrets["SQL_DATABASE"]
+SQL_USERNAME = st.secrets["SQL_USERNAME"]
+SQL_PASSWORD = st.secrets["SQL_PASSWORD"]
+SQL_DRIVER = st.secrets.get("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+
+# Opcional: se houver certificado interno sem cadeia confiável,
+# deixe SQL_TRUST_CERTIFICATE = "yes" no secrets.
+SQL_TRUST_CERTIFICATE = str(
+    st.secrets.get("SQL_TRUST_CERTIFICATE", "yes")
+).strip().lower()
+
+# Data mínima da base, conforme regra atual da consulta.
+DATA_MINIMA_SQL = date(2026, 8, 2)
+
 
 # =========================================================
-# LIMITES
+# LIMITES / CACHE
 # =========================================================
-
-MAX_PEDIDOS_POR_CONSULTA = 1000
+MAX_PEDIDOS_POR_CONSULTA = 3000
 MAX_CONSULTAS_POR_USUARIO = 15
 MAX_REQUISICOES_GLOBAIS = 12
 
 CACHE_TTL_SEGUNDOS = 180
-CACHE_MAX_ITENS = 3000
+CACHE_MAX_ITENS = 6000
 
 HTTP_CONNECT_TIMEOUT = 10
 HTTP_READ_TIMEOUT = 45
 TOKEN_TIMEOUT = 30
 
-# A partir deste status o pedido já possui tarefas geradas
 STATUS_MIN_TAREFAS = 29
-
-# Status de tarefa considerado concluído
 TASK_STATUS_CONCLUIDO = "9"
-
-# Fuso horário usado para exibir o acompanhamento hora a hora
 FUSO_HORARIO = "America/Sao_Paulo"
-
-
-# =========================================================
-# COLUNAS DAS TAREFAS
-# =========================================================
 
 COLUNAS_TAREFAS = [
     "Pedido",
@@ -85,11 +82,19 @@ COLUNAS_TAREFAS = [
     "ReasonCod",
 ]
 
+COLUNAS_SQL = [
+    "PEDIDO",
+    "FILIAL",
+    "DATA_CRIACAO",
+    "MENSAGEM_NOTA",
+    "CODIGO",
+    "TIPO_ATENDIMENTO",
+]
+
 
 # =========================================================
 # STATUS DOS PEDIDOS
 # =========================================================
-
 STATUS_MAP = {
     "00": "Ordem em branco",
     "02": "Criado extern.",
@@ -132,19 +137,6 @@ STATUS_MAP = {
     "99": "Cancelado intern.",
 }
 
-
-def traduzir_status(codigo) -> str:
-    """Traduz o código de status do pedido."""
-    return STATUS_MAP.get(
-        str(codigo).strip(),
-        f"Desconhecido ({codigo})"
-    )
-
-
-# =========================================================
-# STATUS DAS TAREFAS
-# =========================================================
-
 TASK_STATUS_MAP = {
     "0": "Pendente",
     "3": "Em processamento",
@@ -157,32 +149,40 @@ TASK_STATUS_MAP = {
 }
 
 
+def traduzir_status(codigo) -> str:
+    return STATUS_MAP.get(
+        str(codigo).strip(),
+        f"Desconhecido ({codigo})",
+    )
+
+
 def traduzir_status_tarefa(codigo) -> str:
-    """Traduz o código de status da tarefa."""
     return TASK_STATUS_MAP.get(
         str(codigo).strip(),
-        f"Desconhecido ({codigo})"
+        f"Desconhecido ({codigo})",
     )
 
 
 # =========================================================
 # CONFIGURAÇÃO STREAMLIT
 # =========================================================
-
 st.set_page_config(
     page_title="Acompanhamento Demanda",
     page_icon="📦",
     layout="wide",
 )
 
+st.title("📦 Acompanhamento de Demandas - Infor WMS")
+st.caption(
+    "SQL Server define o universo de pedidos e a API do Infor WMS "
+    "complementa status, tarefas e produtividade."
+)
+
 
 # =========================================================
-# CACHE TTL
+# CACHE TTL EM MEMÓRIA
 # =========================================================
-
 class CacheTTL:
-    """Cache simples em memória com expiração e limite de itens."""
-
     def __init__(self, ttl: int, max_itens: int):
         self.ttl = ttl
         self.max_itens = max_itens
@@ -190,8 +190,6 @@ class CacheTTL:
         self._lock = threading.Lock()
 
     def get(self, chave):
-        """Retorna (achou, valor)."""
-
         with self._lock:
             item = self._dados.get(chave)
 
@@ -207,13 +205,11 @@ class CacheTTL:
             return True, valor
 
     def set(self, chave, valor):
-
         with self._lock:
             self._dados.pop(chave, None)
-
             self._dados[chave] = (
                 time.monotonic() + self.ttl,
-                valor
+                valor,
             )
 
             while len(self._dados) > self.max_itens:
@@ -221,12 +217,9 @@ class CacheTTL:
 
 
 # =========================================================
-# SESSÃO HTTP
+# HTTP / RECURSOS COMPARTILHADOS
 # =========================================================
-
 def criar_sessao() -> requests.Session:
-    """Cria sessão HTTP com pool e retry."""
-
     retry = Retry(
         total=3,
         connect=3,
@@ -252,9 +245,7 @@ def criar_sessao() -> requests.Session:
 
 
 class Recursos:
-
     def __init__(self):
-
         self.sessao = criar_sessao()
 
         self.limitador = threading.BoundedSemaphore(
@@ -263,32 +254,155 @@ class Recursos:
 
         self.cache_pedidos = CacheTTL(
             CACHE_TTL_SEGUNDOS,
-            CACHE_MAX_ITENS
+            CACHE_MAX_ITENS,
         )
 
         self.cache_tarefas = CacheTTL(
             CACHE_TTL_SEGUNDOS,
-            CACHE_MAX_ITENS
+            CACHE_MAX_ITENS,
         )
 
 
 @st.cache_resource
 def get_recursos() -> Recursos:
-    """Conjunto de recursos compartilhado entre os usuários."""
     return Recursos()
+
+
+# =========================================================
+# SQL SERVER
+# =========================================================
+def get_sql_connection_string() -> str:
+    trust_value = (
+        "yes"
+        if SQL_TRUST_CERTIFICATE in {"yes", "true", "1", "sim"}
+        else "no"
+    )
+
+    return (
+        f"DRIVER={{{SQL_DRIVER}}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+        "Encrypt=yes;"
+        f"TrustServerCertificate={trust_value};"
+        "Connection Timeout=30;"
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def carregar_base_sql(
+    data_inicial: date,
+    data_final: date,
+) -> pd.DataFrame:
+    """
+    Consulta a SC5010 diretamente no SQL Server.
+
+    O filtro de data é executado no SQL para evitar carregar
+    pedidos desnecessários no Streamlit.
+    """
+    sql = """
+    SELECT
+        RTRIM(C5_NUM) AS PEDIDO,
+        RTRIM(C5_FILIAL) AS FILIAL,
+        C5_EMISSAO AS DATA_CRIACAO,
+        RTRIM(C5_MENNOTA) AS MENSAGEM_NOTA,
+
+        CASE
+            WHEN LEFT(LTRIM(RTRIM(C5_MENNOTA)), 10) LIKE
+                 '[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]'
+            THEN LEFT(LTRIM(RTRIM(C5_MENNOTA)), 10)
+            ELSE 'Sem código'
+        END AS CODIGO,
+
+        CASE
+            WHEN C5_XXA2B = '101' THEN 'PICKING'
+            WHEN C5_XXA2B = '202' THEN 'CROSS'
+            WHEN C5_XXA2B = '303' THEN 'MKT/BONIFICACAO/AMOSTRA'
+            WHEN C5_XXA2B = '404' THEN 'CORPORATIVO'
+            WHEN C5_XXA2B = '505' THEN 'ATACADO'
+            WHEN C5_XXA2B = '606' THEN 'FATURAMENTO'
+            WHEN C5_XXA2B = '707' THEN 'FRANQUIA'
+            WHEN C5_XXA2B = '808' THEN 'ENXOVAL'
+            WHEN C5_XXA2B = '909' THEN 'ALMOXARIFADO'
+            ELSE 'REGISTRAR'
+        END AS TIPO_ATENDIMENTO
+
+    FROM SC5010 WITH (NOLOCK)
+
+    WHERE C5_FILIAL IN ('011004', '011005', '011324')
+      AND C5_EMISSAO > '20260801'
+      AND C5_XXA2B IN (
+          '101','202','303','404','505',
+          '606','707','808','909'
+      )
+      AND C5_EMISSAO >= ?
+      AND C5_EMISSAO <= ?
+      AND D_E_L_E_T_ = ''
+    """
+
+    ini_sql = data_inicial.strftime("%Y%m%d")
+    fim_sql = data_final.strftime("%Y%m%d")
+
+    with pyodbc.connect(get_sql_connection_string()) as conexao:
+        df = pd.read_sql_query(
+            sql,
+            conexao,
+            params=[ini_sql, fim_sql],
+        )
+
+    if df.empty:
+        return pd.DataFrame(columns=COLUNAS_SQL)
+
+    for coluna in (
+        "PEDIDO",
+        "FILIAL",
+        "MENSAGEM_NOTA",
+        "CODIGO",
+        "TIPO_ATENDIMENTO",
+    ):
+        if coluna in df.columns:
+            df[coluna] = (
+                df[coluna]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+
+    df["DATA_CRIACAO"] = pd.to_datetime(
+        df["DATA_CRIACAO"],
+        format="%Y%m%d",
+        errors="coerce",
+    )
+
+    return df
+
+
+def aplicar_filtros_sql(
+    df_sql: pd.DataFrame,
+    filiais: list[str],
+    tipos: list[str],
+    codigos: list[str],
+) -> pd.DataFrame:
+    df = df_sql.copy()
+
+    if filiais:
+        df = df[df["FILIAL"].isin(filiais)]
+
+    if tipos:
+        df = df[df["TIPO_ATENDIMENTO"].isin(tipos)]
+
+    if codigos:
+        df = df[df["CODIGO"].isin(codigos)]
+
+    return df
 
 
 # =========================================================
 # TOKEN
 # =========================================================
-
 @st.cache_data(ttl=3300, show_spinner=False)
 def get_token() -> str:
-    """
-    Obtém e mantém o token OAuth2 em cache.
-    TTL de segurança: 55 minutos.
-    """
-
     payload = {
         "grant_type": "password",
         "client_id": CLIENT_ID,
@@ -306,7 +420,6 @@ def get_token() -> str:
     response.raise_for_status()
 
     dados = response.json()
-
     token = dados.get("access_token")
 
     if not token:
@@ -320,7 +433,6 @@ def get_token() -> str:
 # =========================================================
 # REQUISIÇÃO HTTP
 # =========================================================
-
 def _requisitar(
     recursos: Recursos,
     metodo: str,
@@ -329,20 +441,17 @@ def _requisitar(
     renovar_token_em_401: bool = True,
     **kwargs,
 ) -> requests.Response:
-
     timeout = kwargs.pop(
         "timeout",
         (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
     )
 
     def enviar(token_atual: str):
-
         headers = {
             "Authorization": f"Bearer {token_atual}"
         }
 
         with recursos.limitador:
-
             return recursos.sessao.request(
                 metodo,
                 url,
@@ -354,17 +463,11 @@ def _requisitar(
     resposta = enviar(token)
 
     if resposta.status_code == 401 and renovar_token_em_401:
-
         try:
-
             get_token.clear()
-
             novo_token = get_token()
-
             resposta = enviar(novo_token)
-
         except Exception:
-
             pass
 
     return resposta
@@ -373,14 +476,12 @@ def _requisitar(
 # =========================================================
 # CONSULTA DE PEDIDO
 # =========================================================
-
 def consulta_wms(
     pedido,
     token: str,
-    recursos: Recursos
+    recursos: Recursos,
 ) -> dict | None:
-
-    chave = str(pedido)
+    chave = str(pedido).strip()
 
     achou, valor = recursos.cache_pedidos.get(chave)
 
@@ -390,31 +491,24 @@ def consulta_wms(
     resposta = _requisitar(
         recursos,
         "GET",
-        f"{BASE_URL}/{pedido}",
-        token
+        f"{BASE_URL}/{chave}",
+        token,
     )
 
     if resposta.status_code == 404:
-
         valor = None
-
     else:
-
         resposta.raise_for_status()
-
         dados = resposta.json()
 
         valor = {
-            "orderkey": dados.get("orderkey", pedido),
+            "orderkey": dados.get("orderkey", chave),
             "status": dados.get("status", ""),
             "totalqty": dados.get("totalqty", 0),
             "ext_udf_str4": dados.get("ext_udf_str4", ""),
         }
 
-    recursos.cache_pedidos.set(
-        chave,
-        valor
-    )
+    recursos.cache_pedidos.set(chave, valor)
 
     return valor
 
@@ -422,14 +516,12 @@ def consulta_wms(
 # =========================================================
 # CONSULTA DE TAREFAS
 # =========================================================
-
 def consulta_tasks(
     pedido,
     token: str,
-    recursos: Recursos
+    recursos: Recursos,
 ) -> list[dict]:
-
-    chave = str(pedido)
+    chave = str(pedido).strip()
 
     achou, valor = recursos.cache_tarefas.get(chave)
 
@@ -441,17 +533,15 @@ def consulta_tasks(
         "POST",
         TASKS_URL,
         token,
-        json={"orderkey": chave}
+        json={"orderkey": chave},
     )
 
     resposta.raise_for_status()
 
     dados = resposta.json()
-
     dados = dados if isinstance(dados, list) else []
 
     valor = [
-
         {
             "status": t.get("status", ""),
             "tasktype": t.get("tasktype", ""),
@@ -464,14 +554,10 @@ def consulta_tasks(
             "endtime": t.get("endtime"),
             "reasonkey": t.get("reasonkey", ""),
         }
-
         for t in dados
     ]
 
-    recursos.cache_tarefas.set(
-        chave,
-        valor
-    )
+    recursos.cache_tarefas.set(chave, valor)
 
     return valor
 
@@ -479,16 +565,14 @@ def consulta_tasks(
 # =========================================================
 # PARSER DE LISTA OR
 # =========================================================
-
 def parse_lista_or(texto: str) -> list[str]:
-
     if not texto or not texto.strip():
         return []
 
     partes = re.split(
         r"\s*\bor\b\s*",
         texto.strip(),
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
     return list(
@@ -503,14 +587,12 @@ def parse_lista_or(texto: str) -> list[str]:
 # =========================================================
 # CONSULTAR PEDIDOS
 # =========================================================
-
 def consultar_pedidos(
     lista_pedidos: list,
     token: str,
     recursos: Recursos,
-    max_workers: int = 8
+    max_workers: int = 8,
 ) -> tuple[list[dict], list, list]:
-
     resultados = []
     nao_encontrados = []
     falhas = []
@@ -533,65 +615,61 @@ def consultar_pedidos(
         min(
             int(max_workers),
             MAX_CONSULTAS_POR_USUARIO,
-            MAX_REQUISICOES_GLOBAIS
-        )
+            MAX_REQUISICOES_GLOBAIS,
+        ),
     )
 
     concluidos = 0
 
     barra = st.progress(
         0.0,
-        text="Consultando pedidos..."
+        text="Consultando pedidos na API do Infor...",
     )
 
     with ThreadPoolExecutor(
         max_workers=max_workers
     ) as executor:
-
         futuros = {
-
             executor.submit(
                 consulta_wms,
                 pedido,
                 token,
-                recursos
+                recursos,
             ): pedido
-
             for pedido in lista_pedidos
         }
 
         for futuro in as_completed(futuros):
-
             pedido = futuros[futuro]
 
             try:
-
                 dados = futuro.result()
 
                 if dados is None:
-
                     nao_encontrados.append(pedido)
-
                 else:
-
                     codigo_status = dados["status"]
 
                     resultados.append(
                         {
-                            "Pedido": dados["orderkey"],
+                            "Pedido": str(
+                                dados["orderkey"]
+                            ).strip(),
                             "StatusCod": codigo_status,
                             "Status": traduzir_status(
                                 codigo_status
                             ),
-                            "Peças": dados["totalqty"],
-                            "MensagemNota": dados[
+                            "Peças": pd.to_numeric(
+                                dados["totalqty"],
+                                errors="coerce",
+                            ),
+                            "MensagemNotaAPI": dados[
                                 "ext_udf_str4"
                             ],
                         }
                     )
 
             except requests.exceptions.RequestException:
-
                 falhas.append(pedido)
 
             concluidos += 1
@@ -599,51 +677,38 @@ def consultar_pedidos(
             barra.progress(
                 concluidos / total,
                 text=(
-                    f"Consultando pedidos... "
+                    "Consultando pedidos na API do Infor... "
                     f"({concluidos}/{total})"
-                )
+                ),
             )
 
     barra.empty()
 
-    return (
-        resultados,
-        nao_encontrados,
-        falhas
-    )
+    return resultados, nao_encontrados, falhas
 
 
 # =========================================================
 # ELEGIBILIDADE DE TAREFAS
 # =========================================================
-
-def pedido_elegivel_tarefas(
-    codigo_status
-) -> bool:
-
+def pedido_elegivel_tarefas(codigo_status) -> bool:
     try:
-
         return (
             int(str(codigo_status).strip())
             >= STATUS_MIN_TAREFAS
         )
-
     except ValueError:
-
         return False
 
 
 # =========================================================
 # CONSULTAR TAREFAS
 # =========================================================
-
 def consultar_tarefas(
     lista_pedidos: list,
     token: str,
     recursos: Recursos,
-    max_workers: int = 8
+    max_workers: int = 8,
 ) -> tuple[list[dict], list]:
-
     tarefas_flat = []
     falhas = []
 
@@ -665,74 +730,60 @@ def consultar_tarefas(
         min(
             int(max_workers),
             MAX_CONSULTAS_POR_USUARIO,
-            MAX_REQUISICOES_GLOBAIS
-        )
+            MAX_REQUISICOES_GLOBAIS,
+        ),
     )
 
     concluidos = 0
 
     barra = st.progress(
         0.0,
-        text="Consultando tarefas geradas..."
+        text="Consultando tarefas geradas...",
     )
 
     with ThreadPoolExecutor(
         max_workers=max_workers
     ) as executor:
-
         futuros = {
-
             executor.submit(
                 consulta_tasks,
                 pedido,
                 token,
-                recursos
+                recursos,
             ): pedido
-
             for pedido in lista_pedidos
         }
 
         for futuro in as_completed(futuros):
-
             pedido = futuros[futuro]
 
             try:
-
                 for tarefa in futuro.result():
-
                     codigo_status = tarefa["status"]
 
                     tarefas_flat.append(
                         {
-                            "Pedido": pedido,
+                            "Pedido": str(pedido).strip(),
                             "StatusCod": codigo_status,
                             "Status": traduzir_status_tarefa(
                                 codigo_status
                             ),
-                            "TipoTarefa": tarefa[
-                                "tasktype"
-                            ],
+                            "TipoTarefa": tarefa["tasktype"],
                             "SKU": tarefa["sku"],
-                            "Qtd": tarefa["qty"],
+                            "Qtd": pd.to_numeric(
+                                tarefa["qty"],
+                                errors="coerce",
+                            ),
                             "DeLoc": tarefa["fromloc"],
                             "ParaLoc": tarefa["toloc"],
-                            "UserKey": tarefa[
-                                "userkey"
-                            ],
-                            "StartTime": tarefa[
-                                "starttime"
-                            ],
-                            "EndTime": tarefa[
-                                "endtime"
-                            ],
-                            "ReasonCod": tarefa[
-                                "reasonkey"
-                            ],
+                            "UserKey": tarefa["userkey"],
+                            "StartTime": tarefa["starttime"],
+                            "EndTime": tarefa["endtime"],
+                            "ReasonCod": tarefa["reasonkey"],
                         }
                     )
 
             except requests.exceptions.RequestException:
-
                 falhas.append(pedido)
 
             concluidos += 1
@@ -740,9 +791,9 @@ def consultar_tarefas(
             barra.progress(
                 concluidos / total,
                 text=(
-                    f"Consultando tarefas geradas... "
+                    "Consultando tarefas geradas... "
                     f"({concluidos}/{total})"
-                )
+                ),
             )
 
     barra.empty()
@@ -753,34 +804,19 @@ def consultar_tarefas(
 # =========================================================
 # RANKING DE COLABORADORES
 # =========================================================
-
 def calcular_ranking_colaboradores(
     df_tarefas: pd.DataFrame,
-    top_n: int = 10
+    top_n: int = 10,
 ) -> pd.DataFrame:
-
-    """
-    A partir das tarefas com status Concluído e sem motivo preenchido,
-    monta o ranking dos colaboradores.
-
-    Calcula:
-    - quantidade de tarefas concluídas
-    - tempo médio de separação
-    - peças por hora
-    """
-
     colunas_saida = [
         "Usuário",
         "Tarefas Concluídas",
         "Tempo Médio (min)",
-        "Peças/Hora"
+        "Peças/Hora",
     ]
 
     if df_tarefas.empty:
-
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+        return pd.DataFrame(columns=colunas_saida)
 
     df = df_tarefas[
         df_tarefas["StatusCod"]
@@ -796,7 +832,7 @@ def calcular_ranking_colaboradores(
         != ""
     ]
 
-    # Tarefas com motivo não entram na produtividade
+    # Tarefas com motivo não entram na produtividade.
     df = df[
         df["ReasonCod"]
         .astype(str)
@@ -805,21 +841,23 @@ def calcular_ranking_colaboradores(
     ]
 
     if df.empty:
+        return pd.DataFrame(columns=colunas_saida)
 
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+    df["Qtd"] = pd.to_numeric(
+        df["Qtd"],
+        errors="coerce",
+    ).fillna(0)
 
     df["StartTime"] = pd.to_datetime(
         df["StartTime"],
         errors="coerce",
-        utc=True
+        utc=True,
     )
 
     df["EndTime"] = pd.to_datetime(
         df["EndTime"],
         errors="coerce",
-        utc=True
+        utc=True,
     )
 
     df["DuracaoMin"] = (
@@ -833,75 +871,52 @@ def calcular_ranking_colaboradores(
     ]
 
     if df.empty:
-
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+        return pd.DataFrame(columns=colunas_saida)
 
     resumo = (
-
         df.groupby("UserKey")
-
         .agg(
-            Tarefas_Concluidas=(
-                "UserKey",
-                "count"
-            ),
-
-            Tempo_Medio_Min=(
-                "DuracaoMin",
-                "mean"
-            ),
-
-            Total_Qtd=(
-                "Qtd",
-                "sum"
-            ),
-
-            Total_Min=(
-                "DuracaoMin",
-                "sum"
-            ),
+            Tarefas_Concluidas=("UserKey", "count"),
+            Tempo_Medio_Min=("DuracaoMin", "mean"),
+            Total_Qtd=("Qtd", "sum"),
+            Total_Min=("DuracaoMin", "sum"),
         )
-
         .reset_index()
     )
 
-    resumo["Total_Horas"] = (
-        resumo["Total_Min"] / 60
-    )
+    resumo["Total_Horas"] = resumo["Total_Min"] / 60
 
     resumo["Peças/Hora"] = resumo.apply(
-        lambda r:
+        lambda r: (
             round(
-                r["Total_Qtd"]
-                / r["Total_Horas"],
-                1
+                r["Total_Qtd"] / r["Total_Horas"],
+                1,
             )
             if r["Total_Horas"] > 0
-            else 0,
-        axis=1
+            else 0
+        ),
+        axis=1,
     )
 
     resumo["Tempo Médio (min)"] = (
-        resumo["Tempo_Medio_Min"]
-        .round(1)
+        resumo["Tempo_Medio_Min"].round(1)
     )
 
     resumo = resumo.rename(
         columns={
             "UserKey": "Usuário",
-            "Tarefas_Concluidas":
-                "Tarefas Concluídas"
+            "Tarefas_Concluidas": "Tarefas Concluídas",
         }
     )
 
-    resumo = resumo[
-        colunas_saida
-    ].sort_values(
-        "Tarefas Concluídas",
-        ascending=False
-    ).head(top_n)
+    resumo = (
+        resumo[colunas_saida]
+        .sort_values(
+            "Tarefas Concluídas",
+            ascending=False,
+        )
+        .head(top_n)
+    )
 
     return resumo.reset_index(drop=True)
 
@@ -909,22 +924,17 @@ def calcular_ranking_colaboradores(
 # =========================================================
 # RANKING DE MOTIVOS
 # =========================================================
-
 def calcular_ranking_motivos(
     df_tarefas: pd.DataFrame,
-    top_n: int = 10
+    top_n: int = 10,
 ) -> pd.DataFrame:
-
     colunas_saida = [
         "Motivo",
-        "Ocorrências"
+        "Ocorrências",
     ]
 
     if df_tarefas.empty:
-
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+        return pd.DataFrame(columns=colunas_saida)
 
     df = df_tarefas[
         df_tarefas["ReasonCod"]
@@ -934,10 +944,7 @@ def calcular_ranking_motivos(
     ]
 
     if df.empty:
-
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+        return pd.DataFrame(columns=colunas_saida)
 
     contagem = (
         df["ReasonCod"]
@@ -953,11 +960,7 @@ def calcular_ranking_motivos(
 # =========================================================
 # CLASSIFICAÇÃO DE LOCALIZAÇÃO
 # =========================================================
-
-def classificar_localizacao(
-    fromloc
-) -> str:
-
+def classificar_localizacao(fromloc) -> str:
     loc = str(fromloc).strip()
 
     if loc.endswith("000") or loc.endswith("010"):
@@ -970,65 +973,42 @@ def classificar_localizacao(
 
 
 def classificar_pedidos_por_localizacao(
-    df_tarefas: pd.DataFrame
+    df_tarefas: pd.DataFrame,
 ) -> pd.DataFrame:
-
     colunas_saida = [
         "Pedido",
-        "Classificação"
+        "Classificação",
     ]
 
     if df_tarefas.empty:
-
-        return pd.DataFrame(
-            columns=colunas_saida
-        )
+        return pd.DataFrame(columns=colunas_saida)
 
     df = df_tarefas.copy()
 
-    df["_Faixa"] = df[
-        "DeLoc"
-    ].apply(
+    df["_Faixa"] = df["DeLoc"].apply(
         classificar_localizacao
     )
 
     mapa_combinacoes = {
-
-        frozenset({"Alto"}):
-            "ALTO",
-
-        frozenset({"Baixo"}):
-            "BAIXO",
-
-        frozenset({"Médio"}):
-            "MÉDIO",
-
-        frozenset({"Alto", "Baixo"}):
-            "Parcial A/B",
-
-        frozenset({"Médio", "Baixo"}):
-            "Parcial M/B",
-
-        frozenset({"Alto", "Médio"}):
-            "Parcial A/M",
-
+        frozenset({"Alto"}): "ALTO",
+        frozenset({"Baixo"}): "BAIXO",
+        frozenset({"Médio"}): "MÉDIO",
+        frozenset({"Alto", "Baixo"}): "Parcial A/B",
+        frozenset({"Médio", "Baixo"}): "Parcial M/B",
+        frozenset({"Alto", "Médio"}): "Parcial A/M",
         frozenset(
             {"Alto", "Médio", "Baixo"}
-        ):
-            "Misto A/M/B",
+        ): "Misto A/M/B",
     }
 
     resumo = (
-
         df.groupby("Pedido")["_Faixa"]
-
         .apply(
-            lambda faixas:
-                mapa_combinacoes[
-                    frozenset(faixas)
-                ]
+            lambda faixas: mapa_combinacoes.get(
+                frozenset(faixas),
+                "Misto",
+            )
         )
-
         .reset_index()
     )
 
@@ -1038,23 +1018,17 @@ def classificar_pedidos_por_localizacao(
 
 
 # =========================================================
-# ACOMPANHAMENTO HORA A HORA (TAREFAS)
+# ACOMPANHAMENTO HORA A HORA
 # =========================================================
-
 def calcular_tarefas_hora_a_hora(
-    df_tarefas: pd.DataFrame
+    df_tarefas: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Agrupa as tarefas concluídas por data e hora, com base no EndTime
-    convertido para o fuso de FUSO_HORARIO.
-    """
-
     colunas_saida = [
         "Data",
         "HoraOrdenacao",
         "Hora",
         "Tarefas Concluídas",
-        "Peças"
+        "Peças",
     ]
 
     if df_tarefas.empty:
@@ -1070,10 +1044,15 @@ def calcular_tarefas_hora_a_hora(
     if df.empty:
         return pd.DataFrame(columns=colunas_saida)
 
+    df["Qtd"] = pd.to_numeric(
+        df["Qtd"],
+        errors="coerce",
+    ).fillna(0)
+
     df["EndTime"] = pd.to_datetime(
         df["EndTime"],
         errors="coerce",
-        utc=True
+        utc=True,
     )
 
     df = df[df["EndTime"].notna()].copy()
@@ -1081,7 +1060,10 @@ def calcular_tarefas_hora_a_hora(
     if df.empty:
         return pd.DataFrame(columns=colunas_saida)
 
-    df["EndTime"] = df["EndTime"].dt.tz_convert(FUSO_HORARIO)
+    df["EndTime"] = df["EndTime"].dt.tz_convert(
+        FUSO_HORARIO
+    )
+
     df["Data"] = df["EndTime"].dt.date
     df["HoraOrdenacao"] = df["EndTime"].dt.floor("h")
 
@@ -1089,7 +1071,10 @@ def calcular_tarefas_hora_a_hora(
         df.groupby(["Data", "HoraOrdenacao"])
         .agg(
             **{
-                "Tarefas Concluídas": ("HoraOrdenacao", "count"),
+                "Tarefas Concluídas": (
+                    "HoraOrdenacao",
+                    "count",
+                ),
                 "Peças": ("Qtd", "sum"),
             }
         )
@@ -1097,294 +1082,576 @@ def calcular_tarefas_hora_a_hora(
         .sort_values("HoraOrdenacao")
     )
 
-    resumo["Hora"] = resumo["HoraOrdenacao"].dt.strftime("%Hh")
+    resumo["Hora"] = (
+        resumo["HoraOrdenacao"]
+        .dt.strftime("%Hh")
+    )
 
     return resumo[colunas_saida]
 
 
 # =========================================================
-# LIMPAR RESULTADOS
+# ESTADO / LIMPEZA
 # =========================================================
-
 def limpar_resultados():
-
     for chave in (
         "df_pedidos",
+        "df_sql_selecionado",
         "falhas",
         "nao_encontrados",
         "df_tarefas",
-        "tarefas_falhas"
+        "tarefas_falhas",
+        "origem_consulta",
     ):
+        st.session_state.pop(chave, None)
 
-        st.session_state.pop(
-            chave,
-            None
+
+def salvar_resultados(
+    resultados: list[dict],
+    nao_encontrados: list,
+    falhas: list,
+    tarefas_flat: list[dict],
+    tarefas_falhas: list,
+    origem_consulta: str,
+    df_sql_selecionado: pd.DataFrame | None = None,
+):
+    st.session_state["df_pedidos"] = pd.DataFrame(
+        resultados
+    )
+
+    st.session_state["falhas"] = falhas
+    st.session_state["nao_encontrados"] = nao_encontrados
+
+    st.session_state["df_tarefas"] = (
+        pd.DataFrame(tarefas_flat)
+        if tarefas_flat
+        else pd.DataFrame(columns=COLUNAS_TAREFAS)
+    )
+
+    st.session_state["tarefas_falhas"] = tarefas_falhas
+    st.session_state["origem_consulta"] = origem_consulta
+
+    if df_sql_selecionado is not None:
+        st.session_state[
+            "df_sql_selecionado"
+        ] = df_sql_selecionado.copy()
+
+
+def executar_api_para_lista(
+    lista_pedidos: list[str],
+    paralelismo: int,
+    origem_consulta: str,
+    df_sql_selecionado: pd.DataFrame | None = None,
+):
+    if not lista_pedidos:
+        st.warning(
+            "Nenhum pedido foi selecionado para consulta."
+        )
+        return
+
+    if len(lista_pedidos) > MAX_PEDIDOS_POR_CONSULTA:
+        st.warning(
+            f"A seleção possui {len(lista_pedidos):,} pedidos. "
+            f"O limite configurado é "
+            f"{MAX_PEDIDOS_POR_CONSULTA:,}."
+            .replace(",", ".")
+        )
+        return
+
+    recursos = get_recursos()
+
+    with st.spinner("Autenticando na API do Infor..."):
+        token = get_token()
+
+    resultados, nao_encontrados, falhas = (
+        consultar_pedidos(
+            lista_pedidos,
+            token,
+            recursos,
+            max_workers=paralelismo,
+        )
+    )
+
+    if not resultados:
+        limpar_resultados()
+
+        mensagem = (
+            "Nenhum pedido foi encontrado no WMS "
+            "para a seleção informada."
         )
 
+        if falhas:
+            mensagem += (
+                f" ({len(falhas)} pedido(s) "
+                "tiveram erro de consulta.)"
+            )
 
-# =========================================================
-# INTERFACE
-# =========================================================
+        st.warning(mensagem)
+        return
 
-st.title(
-    "📦 Acompanhamento De Demandas - Infor WMS"
-)
+    pedidos_elegiveis = sorted(
+        {
+            str(r["Pedido"]).strip()
+            for r in resultados
+            if pedido_elegivel_tarefas(
+                r["StatusCod"]
+            )
+        }
+    )
 
-st.caption(
-    "Consulta de pedidos (shipments) via API REST "
-    "do Infor WMS • otimizado para Streamlit Cloud"
-)
+    tarefas_flat, tarefas_falhas = (
+        consultar_tarefas(
+            pedidos_elegiveis,
+            token,
+            recursos,
+            max_workers=paralelismo,
+        )
+    )
+
+    salvar_resultados(
+        resultados=resultados,
+        nao_encontrados=nao_encontrados,
+        falhas=falhas,
+        tarefas_flat=tarefas_flat,
+        tarefas_falhas=tarefas_falhas,
+        origem_consulta=origem_consulta,
+        df_sql_selecionado=df_sql_selecionado,
+    )
 
 
 # =========================================================
 # SIDEBAR
 # =========================================================
-
 with st.sidebar:
+    st.header("Filtros de consulta")
 
-    st.header(
-        "Filtros de consulta"
-    )
-
-    modo_busca = st.radio(
-        "Tipo de busca",
+    origem = st.radio(
+        "Origem dos pedidos",
         [
-            "Faixa de pedidos",
-            "Lista de pedidos (OR)"
-        ]
+            "SQL Server",
+            "Consulta manual",
+        ],
     )
 
-    with st.form("form_consulta"):
+    paralelismo = st.slider(
+        "Consultas simultâneas na API",
+        min_value=1,
+        max_value=MAX_CONSULTAS_POR_USUARIO,
+        value=8,
+        help=(
+            "Quantidade de requisições paralelas enviadas "
+            "à API do Infor."
+        ),
+    )
+
+    st.caption(
+        f"Limite configurado: "
+        f"{MAX_PEDIDOS_POR_CONSULTA:,} pedidos por consulta."
+        .replace(",", ".")
+    )
+
+
+# =========================================================
+# MODO SQL SERVER
+# =========================================================
+if origem == "SQL Server":
+    hoje = date.today()
+    default_ini = max(
+        DATA_MINIMA_SQL,
+        hoje - timedelta(days=7),
+    )
+
+    with st.sidebar.form("form_sql"):
+        st.subheader("Base SQL")
+
+        data_inicial = st.date_input(
+            "Data inicial",
+            value=default_ini,
+            min_value=DATA_MINIMA_SQL,
+            max_value=hoje,
+            format="DD/MM/YYYY",
+        )
+
+        data_final = st.date_input(
+            "Data final",
+            value=hoje,
+            min_value=DATA_MINIMA_SQL,
+            max_value=hoje,
+            format="DD/MM/YYYY",
+        )
+
+        carregar_sql = st.form_submit_button(
+            "🔄 Carregar filtros",
+            use_container_width=True,
+        )
+
+    if carregar_sql:
+        if data_final < data_inicial:
+            st.sidebar.warning(
+                "A data final deve ser maior ou igual "
+                "à data inicial."
+            )
+        else:
+            try:
+                with st.spinner(
+                    "Consultando a base no SQL Server..."
+                ):
+                    df_base_sql = carregar_base_sql(
+                        data_inicial,
+                        data_final,
+                    )
+
+                st.session_state["df_base_sql"] = (
+                    df_base_sql
+                )
+
+                st.session_state[
+                    "periodo_sql"
+                ] = (
+                    data_inicial,
+                    data_final,
+                )
+
+            except Exception as e:
+                st.error(
+                    "Erro ao consultar o SQL Server: "
+                    f"{e}"
+                )
+
+    df_base_sql = st.session_state.get(
+        "df_base_sql",
+        pd.DataFrame(columns=COLUNAS_SQL),
+    )
+
+    if not df_base_sql.empty:
+        periodo_sql = st.session_state.get(
+            "periodo_sql"
+        )
+
+        if periodo_sql:
+            st.info(
+                "Base carregada do SQL Server: "
+                f"**{periodo_sql[0].strftime('%d/%m/%Y')}** "
+                "até "
+                f"**{periodo_sql[1].strftime('%d/%m/%Y')}** "
+                f"• **{df_base_sql['PEDIDO'].nunique():,} "
+                "pedidos**"
+                .replace(",", ".")
+            )
+
+        filiais_disponiveis = sorted(
+            df_base_sql["FILIAL"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        tipos_disponiveis = sorted(
+            df_base_sql["TIPO_ATENDIMENTO"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        codigos_disponiveis = sorted(
+            df_base_sql["CODIGO"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        with st.sidebar.form("form_filtros_sql"):
+            st.subheader("Filtros operacionais")
+
+            filiais_selecionadas = st.multiselect(
+                "Filial",
+                options=filiais_disponiveis,
+                default=filiais_disponiveis,
+            )
+
+            tipos_selecionados = st.multiselect(
+                "Tipo de atendimento",
+                options=tipos_disponiveis,
+                default=tipos_disponiveis,
+            )
+
+            codigos_selecionados = st.multiselect(
+                "Código",
+                options=codigos_disponiveis,
+                default=codigos_disponiveis,
+                help=(
+                    "Código validado no padrão 000000-000. "
+                    "Casos fora do padrão aparecem como "
+                    "'Sem código'."
+                ),
+            )
+
+            consultar_sql_api = st.form_submit_button(
+                "🔍 Consultar no Infor",
+                use_container_width=True,
+            )
+
+        df_preview_sql = aplicar_filtros_sql(
+            df_base_sql,
+            filiais_selecionadas,
+            tipos_selecionados,
+            codigos_selecionados,
+        )
+
+        st.subheader("🧾 Seleção do SQL Server")
+
+        p1, p2, p3, p4 = st.columns(4)
+
+        p1.metric(
+            "Pedidos selecionados",
+            f"{df_preview_sql['PEDIDO'].nunique():,}"
+            .replace(",", "."),
+        )
+
+        p2.metric(
+            "Registros SQL",
+            f"{len(df_preview_sql):,}"
+            .replace(",", "."),
+        )
+
+        p3.metric(
+            "Filiais",
+            df_preview_sql["FILIAL"].nunique(),
+        )
+
+        p4.metric(
+            "Tipos de atendimento",
+            df_preview_sql[
+                "TIPO_ATENDIMENTO"
+            ].nunique(),
+        )
+
+        with st.expander(
+            "Ver pedidos selecionados no SQL",
+            expanded=False,
+        ):
+            preview = df_preview_sql.copy()
+
+            preview["DATA_CRIACAO"] = (
+                preview["DATA_CRIACAO"]
+                .dt.strftime("%d/%m/%Y")
+            )
+
+            st.dataframe(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if consultar_sql_api:
+            lista_pedidos = (
+                df_preview_sql["PEDIDO"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .loc[lambda s: s != ""]
+                .drop_duplicates()
+                .tolist()
+            )
+
+            try:
+                executar_api_para_lista(
+                    lista_pedidos=lista_pedidos,
+                    paralelismo=paralelismo,
+                    origem_consulta="SQL Server",
+                    df_sql_selecionado=df_preview_sql,
+                )
+            except requests.exceptions.HTTPError as e:
+                st.error(
+                    f"Erro de autenticação/API: {e}"
+                )
+            except Exception as e:
+                st.error(
+                    f"Erro inesperado: {e}"
+                )
+
+    else:
+        st.info(
+            "Selecione o período na barra lateral e clique "
+            "em **Carregar filtros** para consultar o "
+            "SQL Server."
+        )
+
+
+# =========================================================
+# MODO MANUAL
+# =========================================================
+else:
+    with st.sidebar.form("form_manual"):
+        modo_busca = st.radio(
+            "Tipo de busca manual",
+            [
+                "Faixa de pedidos",
+                "Lista de pedidos (OR)",
+            ],
+        )
 
         if modo_busca == "Faixa de pedidos":
-
             inicio = st.number_input(
                 "Pedido inicial",
                 min_value=1,
-                step=1
+                step=1,
             )
 
             fim = st.number_input(
                 "Pedido final",
                 min_value=1,
-                step=1
+                step=1,
             )
 
         else:
-
             texto_pedidos = st.text_area(
                 "Pedidos",
                 placeholder=(
                     "pedido1 or pedido2 or pedido3"
                 ),
                 help=(
-                    "Separe os pedidos com 'or' "
-                    "(não diferencia maiúsculas/"
-                    "minúsculas)."
+                    "Separe os pedidos com 'or'."
                 ),
             )
 
-        paralelismo = st.slider(
-            "Consultas simultâneas",
-            min_value=1,
-            max_value=MAX_CONSULTAS_POR_USUARIO,
-            value=8,
-            help=(
-                "Número de requisições feitas "
-                "em paralelo."
-            ),
-        )
-
-        consultar = st.form_submit_button(
+        consultar_manual = st.form_submit_button(
             "🔍 Consultar",
-            use_container_width=True
+            use_container_width=True,
         )
 
-    st.caption(
-        f"Limite de "
-        f"{MAX_PEDIDOS_POR_CONSULTA} "
-        f"pedidos por consulta."
-    )
-
-
-# =========================================================
-# EXECUÇÃO DA CONSULTA
-# =========================================================
-
-if consultar:
-
-    try:
-
-        if modo_busca == "Faixa de pedidos":
-
-            if int(fim) < int(inicio):
-
-                st.warning(
-                    "O pedido final deve ser maior "
-                    "ou igual ao pedido inicial."
-                )
-
-                st.stop()
-
-            lista_pedidos = list(
-                range(
-                    int(inicio),
-                    int(fim) + 1
-                )
-            )
-
-        else:
-
-            lista_pedidos = parse_lista_or(
-                texto_pedidos
-            )
-
-            if not lista_pedidos:
-
-                st.warning(
-                    "Informe ao menos um pedido, "
-                    "separado por 'or'."
-                )
-
-                st.stop()
-
-        if len(lista_pedidos) > MAX_PEDIDOS_POR_CONSULTA:
-
-            st.warning(
-                f"A consulta tem "
-                f"{len(lista_pedidos)} pedidos. "
-                f"O limite é de "
-                f"{MAX_PEDIDOS_POR_CONSULTA}."
-            )
-
-            st.stop()
-
-        recursos = get_recursos()
-
-        with st.spinner(
-            "Autenticando..."
-        ):
-
-            token = get_token()
-
-        resultados, nao_encontrados, falhas = (
-            consultar_pedidos(
-                lista_pedidos,
-                token,
-                recursos,
-                max_workers=paralelismo
-            )
-        )
-
-        if not resultados:
-
-            limpar_resultados()
-
-            mensagem = (
-                "Nenhum pedido foi encontrado "
-                "para a consulta informada."
-            )
-
-            if falhas:
-
-                mensagem += (
-                    f" ({len(falhas)} pedido(s) "
-                    f"tiveram erro de consulta.)"
-                )
-
-            st.warning(mensagem)
-
-        else:
-
-            st.session_state[
-                "df_pedidos"
-            ] = pd.DataFrame(resultados)
-
-            st.session_state[
-                "falhas"
-            ] = falhas
-
-            st.session_state[
-                "nao_encontrados"
-            ] = nao_encontrados
-
-            # Pedidos com status >= 29
-            # já geraram tarefas
-            pedidos_elegiveis = sorted(
-                {
-                    str(r["Pedido"])
-
-                    for r in resultados
-
-                    if pedido_elegivel_tarefas(
-                        r["StatusCod"]
+    if consultar_manual:
+        try:
+            if modo_busca == "Faixa de pedidos":
+                if int(fim) < int(inicio):
+                    st.warning(
+                        "O pedido final deve ser maior "
+                        "ou igual ao pedido inicial."
                     )
-                }
-            )
+                    st.stop()
 
-            tarefas_flat, tarefas_falhas = (
-                consultar_tarefas(
-                    pedidos_elegiveis,
-                    token,
-                    recursos,
-                    max_workers=paralelismo
-                )
-            )
+                lista_pedidos = [
+                    str(x)
+                    for x in range(
+                        int(inicio),
+                        int(fim) + 1,
+                    )
+                ]
 
-            st.session_state[
-                "df_tarefas"
-            ] = (
-
-                pd.DataFrame(
-                    tarefas_flat
+            else:
+                lista_pedidos = parse_lista_or(
+                    texto_pedidos
                 )
 
-                if tarefas_flat
+                if not lista_pedidos:
+                    st.warning(
+                        "Informe ao menos um pedido."
+                    )
+                    st.stop()
 
-                else pd.DataFrame(
-                    columns=COLUNAS_TAREFAS
-                )
+            executar_api_para_lista(
+                lista_pedidos=lista_pedidos,
+                paralelismo=paralelismo,
+                origem_consulta="Consulta manual",
             )
 
-            st.session_state[
-                "tarefas_falhas"
-            ] = tarefas_falhas
+        except requests.exceptions.HTTPError as e:
+            st.error(
+                f"Erro de autenticação/API: {e}"
+            )
 
-    except requests.exceptions.HTTPError as e:
-
-        st.error(
-            f"Erro de autenticação/API: {e}"
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Erro inesperado: {e}"
-        )
+        except Exception as e:
+            st.error(
+                f"Erro inesperado: {e}"
+            )
 
 
 # =========================================================
 # RESULTADOS
 # =========================================================
-
 if "df_pedidos" in st.session_state:
-
-    df = st.session_state[
+    df_api = st.session_state[
         "df_pedidos"
-    ]
+    ].copy()
+
+    df_api["Pedido"] = (
+        df_api["Pedido"]
+        .astype(str)
+        .str.strip()
+    )
+
+    df_api["Peças"] = pd.to_numeric(
+        df_api["Peças"],
+        errors="coerce",
+    ).fillna(0)
+
+    origem_resultado = st.session_state.get(
+        "origem_consulta",
+        "-",
+    )
+
+    # -----------------------------------------------------
+    # CRUZAMENTO SQL + API
+    # -----------------------------------------------------
+    df_sql_selecionado = st.session_state.get(
+        "df_sql_selecionado"
+    )
+
+    if (
+        origem_resultado == "SQL Server"
+        and isinstance(
+            df_sql_selecionado,
+            pd.DataFrame,
+        )
+        and not df_sql_selecionado.empty
+    ):
+        df_sql_join = (
+            df_sql_selecionado
+            .copy()
+            .drop_duplicates(
+                subset=["PEDIDO"],
+                keep="first",
+            )
+        )
+
+        df_sql_join["PEDIDO"] = (
+            df_sql_join["PEDIDO"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df = df_api.merge(
+            df_sql_join,
+            left_on="Pedido",
+            right_on="PEDIDO",
+            how="left",
+        )
+
+        df = df.drop(
+            columns=["PEDIDO"],
+            errors="ignore",
+        )
+
+    else:
+        df = df_api.copy()
+
+        df["FILIAL"] = ""
+        df["DATA_CRIACAO"] = pd.NaT
+        df["MENSAGEM_NOTA"] = ""
+        df["CODIGO"] = ""
+        df["TIPO_ATENDIMENTO"] = ""
 
     falhas = st.session_state.get(
         "falhas",
-        []
+        [],
     )
 
     nao_encontrados = st.session_state.get(
         "nao_encontrados",
-        []
+        [],
     )
 
     if falhas:
-
         st.warning(
             f"⚠️ {len(falhas)} pedido(s) "
             "não puderam ser consultados "
@@ -1392,157 +1659,210 @@ if "df_pedidos" in st.session_state:
         )
 
     if nao_encontrados:
-
         with st.expander(
             f"ℹ️ {len(nao_encontrados)} "
-            "número(s) sem pedido correspondente no WMS"
+            "pedido(s) do SQL/lista sem correspondente no WMS"
         ):
-
             st.write(
                 sorted(
                     nao_encontrados,
-                    key=str
+                    key=str,
                 )
             )
 
-
-    # =====================================================
-    # FILTRO POR MENSAGEM / NOTA
-    # =====================================================
-
-    mensagens = [
-        "Todos"
-    ] + sorted(
-        df["MensagemNota"]
-        .dropna()
-        .unique()
-        .tolist()
+    st.caption(
+        f"Origem da seleção: **{origem_resultado}**"
     )
 
-    filtro = st.selectbox(
-        "Filtrar por Mensagem/Nota",
-        mensagens
-    )
+    # -----------------------------------------------------
+    # FILTROS DO DASHBOARD
+    # -----------------------------------------------------
+    st.divider()
+    st.subheader("🎛️ Filtros do dashboard")
 
-    df_filtrado = (
+    fd1, fd2, fd3, fd4 = st.columns(4)
 
-        df
-
-        if filtro == "Todos"
-
-        else df[
-            df["MensagemNota"]
-            == filtro
-        ]
-    )
-
-
-    # =====================================================
-    # FILTRO DAS TAREFAS PELOS PEDIDOS
-    # =====================================================
-
-    pedidos_filtrados = set(
-        df_filtrado[
-            "Pedido"
-        ].astype(str)
-    )
-
-    df_tarefas_todas = (
-        st.session_state.get(
-            "df_tarefas",
-            pd.DataFrame(
-                columns=COLUNAS_TAREFAS
-            )
+    with fd1:
+        status_disponiveis = sorted(
+            df["Status"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
         )
+
+        status_selecionados = st.multiselect(
+            "Status WMS",
+            options=status_disponiveis,
+            default=status_disponiveis,
+        )
+
+    with fd2:
+        mensagens_disponiveis = sorted(
+            df["MensagemNotaAPI"]
+            .fillna("")
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        mensagens_selecionadas = st.multiselect(
+            "Mensagem/Nota API",
+            options=mensagens_disponiveis,
+            default=mensagens_disponiveis,
+        )
+
+    with fd3:
+        if "TIPO_ATENDIMENTO" in df.columns:
+            tipos_dashboard = sorted(
+                df["TIPO_ATENDIMENTO"]
+                .dropna()
+                .astype(str)
+                .loc[
+                    lambda s: s.str.strip() != ""
+                ]
+                .unique()
+                .tolist()
+            )
+        else:
+            tipos_dashboard = []
+
+        tipos_dashboard_sel = st.multiselect(
+            "Tipo atendimento",
+            options=tipos_dashboard,
+            default=tipos_dashboard,
+            disabled=not bool(tipos_dashboard),
+        )
+
+    with fd4:
+        if "CODIGO" in df.columns:
+            codigos_dashboard = sorted(
+                df["CODIGO"]
+                .dropna()
+                .astype(str)
+                .loc[
+                    lambda s: s.str.strip() != ""
+                ]
+                .unique()
+                .tolist()
+            )
+        else:
+            codigos_dashboard = []
+
+        codigos_dashboard_sel = st.multiselect(
+            "Código",
+            options=codigos_dashboard,
+            default=codigos_dashboard,
+            disabled=not bool(codigos_dashboard),
+        )
+
+    df_filtrado = df.copy()
+
+    if status_selecionados:
+        df_filtrado = df_filtrado[
+            df_filtrado["Status"].isin(
+                status_selecionados
+            )
+        ]
+    else:
+        df_filtrado = df_filtrado.iloc[0:0]
+
+    if mensagens_selecionadas:
+        df_filtrado = df_filtrado[
+            df_filtrado["MensagemNotaAPI"].isin(
+                mensagens_selecionadas
+            )
+        ]
+    else:
+        df_filtrado = df_filtrado.iloc[0:0]
+
+    if tipos_dashboard:
+        if tipos_dashboard_sel:
+            df_filtrado = df_filtrado[
+                df_filtrado[
+                    "TIPO_ATENDIMENTO"
+                ].isin(tipos_dashboard_sel)
+            ]
+        else:
+            df_filtrado = df_filtrado.iloc[0:0]
+
+    if codigos_dashboard:
+        if codigos_dashboard_sel:
+            df_filtrado = df_filtrado[
+                df_filtrado[
+                    "CODIGO"
+                ].isin(codigos_dashboard_sel)
+            ]
+        else:
+            df_filtrado = df_filtrado.iloc[0:0]
+
+    # -----------------------------------------------------
+    # TAREFAS DOS PEDIDOS FILTRADOS
+    # -----------------------------------------------------
+    pedidos_filtrados = set(
+        df_filtrado["Pedido"]
+        .astype(str)
+        .str.strip()
+    )
+
+    df_tarefas_todas = st.session_state.get(
+        "df_tarefas",
+        pd.DataFrame(
+            columns=COLUNAS_TAREFAS
+        ),
     )
 
     df_tarefas = (
         df_tarefas_todas[
-            df_tarefas_todas[
-                "Pedido"
-            ]
+            df_tarefas_todas["Pedido"]
             .astype(str)
+            .str.strip()
             .isin(pedidos_filtrados)
-        ]
+        ].copy()
     )
 
     tarefas_falhas = [
-
         p
-
         for p in st.session_state.get(
             "tarefas_falhas",
-            []
+            [],
         )
-
-        if str(p) in pedidos_filtrados
+        if str(p).strip() in pedidos_filtrados
     ]
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # FILTRO DE COLABORADORES
-    # (aplicado a TODOS os gráficos/tabelas de tarefas abaixo,
-    #  junto com o filtro de Mensagem/Nota já aplicado acima)
-    # =====================================================
-
+    # -----------------------------------------------------
     if not df_tarefas.empty:
-
         usuarios_disponiveis = sorted(
-
-            df_tarefas[
-                "UserKey"
-            ]
-
+            df_tarefas["UserKey"]
             .dropna()
-
             .astype(str)
-
             .str.strip()
-
-            .loc[
-                lambda x: x != ""
-            ]
-
+            .loc[lambda x: x != ""]
             .unique()
-
             .tolist()
         )
 
-        usuarios_selecionados = (
-            st.multiselect(
-
-                "👤 Filtrar colaboradores "
-                "(tarefas, rankings e hora a hora)",
-
-                options=usuarios_disponiveis,
-
-                default=usuarios_disponiveis,
-
-                help=(
-                    "Esse filtro afeta todos os gráficos e tabelas "
-                    "da seção de tarefas abaixo: status, hora a hora, "
-                    "ranking de colaboradores, ranking de motivos e "
-                    "classificação por localização."
-                ),
-            )
+        usuarios_selecionados = st.multiselect(
+            "👤 Filtrar colaboradores "
+            "(tarefas, rankings e hora a hora)",
+            options=usuarios_disponiveis,
+            default=usuarios_disponiveis,
         )
 
         if usuarios_selecionados:
-
             df_tarefas_filtrado = (
                 df_tarefas[
-                    df_tarefas[
-                        "UserKey"
-                    ]
+                    df_tarefas["UserKey"]
                     .astype(str)
+                    .str.strip()
                     .isin(
                         usuarios_selecionados
                     )
                 ].copy()
             )
-
         else:
-
             df_tarefas_filtrado = (
                 pd.DataFrame(
                     columns=df_tarefas.columns
@@ -1550,61 +1870,39 @@ if "df_pedidos" in st.session_state:
             )
 
     else:
-
         usuarios_disponiveis = []
-
         usuarios_selecionados = []
-
-        df_tarefas_filtrado = (
-            pd.DataFrame(
-                columns=COLUNAS_TAREFAS
-            )
+        df_tarefas_filtrado = pd.DataFrame(
+            columns=COLUNAS_TAREFAS
         )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # INDICADORES
-    # =====================================================
-
+    # -----------------------------------------------------
     st.divider()
 
     total_pedidos = (
-        df_filtrado[
-            "Pedido"
-        ].nunique()
+        df_filtrado["Pedido"].nunique()
     )
 
     total_pecas = int(
-        df_filtrado[
-            "Peças"
-        ].sum()
+        df_filtrado["Peças"].sum()
     )
 
     media_pecas = (
-
         round(
-            df_filtrado[
-                "Peças"
-            ].mean(),
-            1
+            df_filtrado["Peças"].mean(),
+            1,
         )
-
         if total_pedidos
-
         else 0
     )
 
     status_predominante = (
-
-        df_filtrado[
-            "Status"
-        ].mode()[0]
-
+        df_filtrado["Status"].mode()[0]
         if not df_filtrado.empty
-
         else "-"
     )
-
 
     col1, col2, col3, col4, col5 = (
         st.columns(5)
@@ -1612,137 +1910,108 @@ if "df_pedidos" in st.session_state:
 
     col1.metric(
         "📄 Pedidos",
-        total_pedidos
+        total_pedidos,
     )
 
     col2.metric(
         "📦 Total de Peças",
         f"{total_pecas:,}".replace(
             ",",
-            "."
-        )
+            ".",
+        ),
     )
 
     col3.metric(
         "📊 Média de Peças/Pedido",
-        media_pecas
+        media_pecas,
     )
 
     col4.metric(
         "🏷️ Status Predominante",
-        status_predominante
+        status_predominante,
     )
 
     col5.metric(
-        "🗂️ Tarefas Geradas",
-        len(df_tarefas_filtrado)
+        "🗂️ Tarefas",
+        len(df_tarefas_filtrado),
     )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # GRÁFICOS DOS PEDIDOS
-    # (nível pedido — seguem o filtro de Mensagem/Nota;
-    #  o filtro de colaboradores não se aplica aqui, pois é
-    #  um conceito de tarefa, não de pedido)
-    # =====================================================
-
+    # -----------------------------------------------------
     st.divider()
 
     g1, g2 = st.columns(2)
 
-
-    # -----------------------------------------------------
-    # PEÇAS POR STATUS
-    # -----------------------------------------------------
-
     with g1:
-
-        st.subheader(
-            "Peças por Status"
-        )
+        st.subheader("Peças por Status")
 
         df_status = (
-
             df_filtrado
-
             .groupby(
                 "Status",
-                as_index=False
+                as_index=False,
             )["Peças"]
-
             .sum()
-
             .sort_values(
                 "Peças",
-                ascending=False
+                ascending=False,
             )
         )
 
-        fig_bar = px.bar(
-            df_status,
-            x="Status",
-            y="Peças",
-            text_auto=True,
-        )
+        if not df_status.empty:
+            fig_bar = px.bar(
+                df_status,
+                x="Status",
+                y="Peças",
+                text_auto=True,
+            )
 
-        fig_bar.update_traces(
-            marker_color="#1f77b4"
-        )
+            fig_bar.update_traces(
+                marker_color="#1f77b4"
+            )
 
-        fig_bar.update_layout(
-            showlegend=False
-        )
+            fig_bar.update_layout(
+                showlegend=False
+            )
 
-        st.plotly_chart(
-            fig_bar,
-            use_container_width=True
-        )
-
-
-    # -----------------------------------------------------
-    # DISTRIBUIÇÃO DE PEDIDOS
-    # -----------------------------------------------------
+            st.plotly_chart(
+                fig_bar,
+                use_container_width=True,
+            )
 
     with g2:
-
         st.subheader(
             "Distribuição de Pedidos por Status"
         )
 
-        fig_pie = px.pie(
-            df_filtrado,
-            names="Status",
-            hole=0.45,
-        )
+        if not df_filtrado.empty:
+            fig_pie = px.pie(
+                df_filtrado,
+                names="Status",
+                hole=0.45,
+            )
 
-        st.plotly_chart(
-            fig_pie,
-            use_container_width=True
-        )
+            st.plotly_chart(
+                fig_pie,
+                use_container_width=True,
+            )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # TAREFAS POR STATUS
-    # (já considera Mensagem/Nota + colaboradores)
-    # =====================================================
-
+    # -----------------------------------------------------
     if not df_tarefas_filtrado.empty:
-
-        st.subheader(
-            "Tarefas por Status"
-        )
+        st.subheader("Tarefas por Status")
 
         contagem_tarefas = (
-            df_tarefas_filtrado[
-                "Status"
-            ]
+            df_tarefas_filtrado["Status"]
             .value_counts()
             .reset_index()
         )
 
         contagem_tarefas.columns = [
             "Status",
-            "Qtd Tarefas"
+            "Qtd Tarefas",
         ]
 
         fig_tarefas = px.bar(
@@ -1759,67 +2028,70 @@ if "df_pedidos" in st.session_state:
 
         st.plotly_chart(
             fig_tarefas,
-            use_container_width=True
+            use_container_width=True,
         )
 
-
-    # =====================================================
-    # ACOMPANHAMENTO HORA A HORA (TAREFAS)
-    # =====================================================
-
+    # -----------------------------------------------------
+    # HORA A HORA
+    # -----------------------------------------------------
     hora_a_hora = calcular_tarefas_hora_a_hora(
         df_tarefas_filtrado
     )
 
     if not hora_a_hora.empty:
-
         st.divider()
 
         st.subheader(
-            "⏱️ Acompanhamento Hora a Hora (Tarefas Concluídas)"
+            "⏱️ Acompanhamento Hora a Hora "
+            "(Tarefas Concluídas)"
         )
 
         st.caption(
-            f"Baseado no horário de conclusão (EndTime) das tarefas, "
-            f"no fuso {FUSO_HORARIO}. Considera o status "
-            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}' e já "
-            "respeita os filtros de Mensagem/Nota e de colaboradores."
+            f"Baseado no EndTime, convertido para "
+            f"{FUSO_HORARIO}. Considera somente tarefas "
+            f"com status "
+            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'."
         )
-
-        # =================================================
-        # FILTRO DE DATA
-        # =================================================
 
         datas_disponiveis = sorted(
             hora_a_hora["Data"]
             .dropna()
             .unique(),
-            reverse=True
+            reverse=True,
         )
 
         data_selecionada = st.selectbox(
             "📅 Data do acompanhamento",
             options=datas_disponiveis,
             index=0,
-            format_func=lambda x: x.strftime("%d/%m/%Y")
+            format_func=lambda x: x.strftime(
+                "%d/%m/%Y"
+            ),
         )
 
         hora_a_hora_dia = (
             hora_a_hora[
-                hora_a_hora["Data"] == data_selecionada
+                hora_a_hora["Data"]
+                == data_selecionada
             ]
             .copy()
             .sort_values("HoraOrdenacao")
         )
 
-        # Garante as 24 horas no eixo, inclusive horas sem produção
-        horas_base = pd.DataFrame({
-            "Hora": [f"{h:02d}h" for h in range(24)],
-            "HoraNum": list(range(24))
-        })
+        horas_base = pd.DataFrame(
+            {
+                "Hora": [
+                    f"{h:02d}h"
+                    for h in range(24)
+                ],
+                "HoraNum": list(range(24)),
+            }
+        )
 
         hora_a_hora_dia["HoraNum"] = (
-            hora_a_hora_dia["HoraOrdenacao"].dt.hour
+            hora_a_hora_dia[
+                "HoraOrdenacao"
+            ].dt.hour
         )
 
         hora_a_hora_dia = (
@@ -1829,30 +2101,34 @@ if "df_pedidos" in st.session_state:
                     [
                         "HoraNum",
                         "Tarefas Concluídas",
-                        "Peças"
+                        "Peças",
                     ]
                 ],
                 on="HoraNum",
-                how="left"
+                how="left",
             )
-            .fillna({
-                "Tarefas Concluídas": 0,
-                "Peças": 0
-            })
+            .fillna(
+                {
+                    "Tarefas Concluídas": 0,
+                    "Peças": 0,
+                }
+            )
             .sort_values("HoraNum")
         )
 
-        hora_a_hora_dia["Tarefas Concluídas"] = (
-            hora_a_hora_dia["Tarefas Concluídas"].astype(int)
+        hora_a_hora_dia[
+            "Tarefas Concluídas"
+        ] = (
+            hora_a_hora_dia[
+                "Tarefas Concluídas"
+            ].astype(int)
         )
 
         hora_a_hora_dia["Peças"] = (
-            hora_a_hora_dia["Peças"].round(0).astype(int)
+            hora_a_hora_dia["Peças"]
+            .round(0)
+            .astype(int)
         )
-
-        # =================================================
-        # GRÁFICO 1 — TAREFAS CONCLUÍDAS POR HORA
-        # =================================================
 
         fig_hh_tarefas = px.bar(
             hora_a_hora_dia,
@@ -1874,11 +2150,19 @@ if "df_pedidos" in st.session_state:
             xaxis_title=None,
             yaxis_title="Tarefas concluídas",
             height=450,
-            margin=dict(t=70, b=50, l=50, r=30),
+            margin=dict(
+                t=70,
+                b=50,
+                l=50,
+                r=30,
+            ),
             xaxis=dict(
                 type="category",
                 categoryorder="array",
-                categoryarray=[f"{h:02d}h" for h in range(24)],
+                categoryarray=[
+                    f"{h:02d}h"
+                    for h in range(24)
+                ],
                 tickangle=0,
                 automargin=True,
             ),
@@ -1890,12 +2174,8 @@ if "df_pedidos" in st.session_state:
 
         st.plotly_chart(
             fig_hh_tarefas,
-            use_container_width=True
+            use_container_width=True,
         )
-
-        # =================================================
-        # GRÁFICO 2 — PEÇAS SEPARADAS POR HORA
-        # =================================================
 
         fig_hh_pecas = px.bar(
             hora_a_hora_dia,
@@ -1917,11 +2197,19 @@ if "df_pedidos" in st.session_state:
             xaxis_title=None,
             yaxis_title="Peças",
             height=450,
-            margin=dict(t=70, b=50, l=50, r=30),
+            margin=dict(
+                t=70,
+                b=50,
+                l=50,
+                r=30,
+            ),
             xaxis=dict(
                 type="category",
                 categoryorder="array",
-                categoryarray=[f"{h:02d}h" for h in range(24)],
+                categoryarray=[
+                    f"{h:02d}h"
+                    for h in range(24)
+                ],
                 tickangle=0,
                 automargin=True,
             ),
@@ -1933,7 +2221,7 @@ if "df_pedidos" in st.session_state:
 
         st.plotly_chart(
             fig_hh_pecas,
-            use_container_width=True
+            use_container_width=True,
         )
 
         st.dataframe(
@@ -1941,26 +2229,21 @@ if "df_pedidos" in st.session_state:
                 [
                     "Hora",
                     "Tarefas Concluídas",
-                    "Peças"
+                    "Peças",
                 ]
             ],
             use_container_width=True,
             hide_index=True,
         )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # RANKING DE COLABORADORES
-    # =====================================================
-
-    ranking = (
-        calcular_ranking_colaboradores(
-            df_tarefas_filtrado
-        )
+    # -----------------------------------------------------
+    ranking = calcular_ranking_colaboradores(
+        df_tarefas_filtrado
     )
 
     if not ranking.empty:
-
         st.divider()
 
         st.subheader(
@@ -1969,33 +2252,21 @@ if "df_pedidos" in st.session_state:
         )
 
         st.caption(
-            "Tarefas com motivo (ReasonCod) "
-            "preenchido não entram nesse ranking."
+            "Tarefas com ReasonCod preenchido não "
+            "entram nesse ranking."
         )
 
         rc1, rc2 = st.columns(2)
 
-
-        # -------------------------------------------------
-        # TAREFAS CONCLUÍDAS
-        # -------------------------------------------------
-
         with rc1:
-
             fig_ranking = px.bar(
-
                 ranking.sort_values(
                     "Tarefas Concluídas"
                 ),
-
                 x="Tarefas Concluídas",
-
                 y="Usuário",
-
                 orientation="h",
-
                 text_auto=True,
-
                 title=(
                     "Tarefas concluídas "
                     "por colaborador"
@@ -2008,30 +2279,18 @@ if "df_pedidos" in st.session_state:
 
             st.plotly_chart(
                 fig_ranking,
-                use_container_width=True
+                use_container_width=True,
             )
 
-
-        # -------------------------------------------------
-        # PEÇAS POR HORA
-        # -------------------------------------------------
-
         with rc2:
-
             fig_pecas_hora = px.bar(
-
                 ranking.sort_values(
                     "Peças/Hora"
                 ),
-
                 x="Peças/Hora",
-
                 y="Usuário",
-
                 orientation="h",
-
                 text_auto=True,
-
                 title=(
                     "Média de peças "
                     "separadas por hora"
@@ -2044,43 +2303,23 @@ if "df_pedidos" in st.session_state:
 
             st.plotly_chart(
                 fig_pecas_hora,
-                use_container_width=True
+                use_container_width=True,
             )
-
-
-        # -------------------------------------------------
-        # TABELA DO RANKING
-        # -------------------------------------------------
 
         st.dataframe(
             ranking,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-        st.caption(
-            "Tempo médio calculado a partir "
-            "de StartTime/EndTime das tarefas "
-            "com status "
-            f"'{traduzir_status_tarefa(TASK_STATUS_CONCLUIDO)}'. "
-            "Peças/Hora = soma de peças separadas "
-            "÷ soma de horas trabalhadas pelo "
-            "colaborador."
-        )
-
-
-    # =====================================================
+    # -----------------------------------------------------
     # RANKING DE MOTIVOS
-    # =====================================================
-
-    ranking_motivos = (
-        calcular_ranking_motivos(
-            df_tarefas_filtrado
-        )
+    # -----------------------------------------------------
+    ranking_motivos = calcular_ranking_motivos(
+        df_tarefas_filtrado
     )
 
     if not ranking_motivos.empty:
-
         st.divider()
 
         st.subheader(
@@ -2088,17 +2327,12 @@ if "df_pedidos" in st.session_state:
         )
 
         fig_motivos = px.bar(
-
             ranking_motivos.sort_values(
                 "Ocorrências"
             ),
-
             x="Ocorrências",
-
             y="Motivo",
-
             orientation="h",
-
             text_auto=True,
         )
 
@@ -2108,20 +2342,18 @@ if "df_pedidos" in st.session_state:
 
         st.plotly_chart(
             fig_motivos,
-            use_container_width=True
+            use_container_width=True,
         )
 
         st.dataframe(
             ranking_motivos,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # CLASSIFICAÇÃO POR LOCALIZAÇÃO
-    # =====================================================
-
+    # -----------------------------------------------------
     classificacao_pedidos = (
         classificar_pedidos_por_localizacao(
             df_tarefas_filtrado
@@ -2129,7 +2361,6 @@ if "df_pedidos" in st.session_state:
     )
 
     if not classificacao_pedidos.empty:
-
         st.divider()
 
         st.subheader(
@@ -2140,42 +2371,30 @@ if "df_pedidos" in st.session_state:
         st.caption(
             "Baseado no fromloc das tarefas: "
             "terminação 000/010 = Baixo, "
-            "020 = Médio, demais = Alto. "
-            "Pedidos com mais de uma faixa "
-            "aparecem como parcial/misto."
+            "020 = Médio, demais = Alto."
         )
 
         cl1, cl2 = st.columns(2)
 
-
         with cl1:
-
             contagem_classificacao = (
-
                 classificacao_pedidos[
                     "Classificação"
                 ]
-
                 .value_counts()
-
                 .reset_index()
             )
 
             contagem_classificacao.columns = [
                 "Classificação",
-                "Qtd Pedidos"
+                "Qtd Pedidos",
             ]
 
             fig_classificacao = px.bar(
-
                 contagem_classificacao,
-
                 x="Classificação",
-
                 y="Qtd Pedidos",
-
                 color="Classificação",
-
                 text_auto=True,
             )
 
@@ -2185,67 +2404,74 @@ if "df_pedidos" in st.session_state:
 
             st.plotly_chart(
                 fig_classificacao,
-                use_container_width=True
+                use_container_width=True,
             )
 
-
         with cl2:
-
             st.dataframe(
-
                 classificacao_pedidos.sort_values(
                     "Pedido"
                 ),
-
                 use_container_width=True,
-
                 hide_index=True,
-
                 height=380,
             )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # TABELA DE PEDIDOS
-    # =====================================================
-
+    # -----------------------------------------------------
     st.divider()
+    st.subheader("📋 Pedidos")
 
-    st.subheader(
-        "📋 Pedidos"
-    )
+    colunas_pedidos = [
+        c
+        for c in [
+            "Pedido",
+            "FILIAL",
+            "DATA_CRIACAO",
+            "CODIGO",
+            "TIPO_ATENDIMENTO",
+            "StatusCod",
+            "Status",
+            "Peças",
+            "MENSAGEM_NOTA",
+            "MensagemNotaAPI",
+        ]
+        if c in df_filtrado.columns
+    ]
+
+    df_exibicao = df_filtrado[
+        colunas_pedidos
+    ].copy()
+
+    if "DATA_CRIACAO" in df_exibicao.columns:
+        df_exibicao["DATA_CRIACAO"] = (
+            pd.to_datetime(
+                df_exibicao["DATA_CRIACAO"],
+                errors="coerce",
+            )
+            .dt.strftime("%d/%m/%Y")
+        )
 
     st.dataframe(
-        df_filtrado,
+        df_exibicao,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
     )
 
-
-    # =====================================================
-    # DOWNLOAD CSV
-    # =====================================================
-
     st.download_button(
-
         "⬇️ Baixar CSV",
-
-        data=df_filtrado
+        data=df_exibicao
         .to_csv(index=False)
-        .encode("utf-8"),
-
+        .encode("utf-8-sig"),
         file_name="pedidos_wms.csv",
-
         mime="text/csv",
     )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # TAREFAS GERADAS
-    # =====================================================
-
+    # -----------------------------------------------------
     if not df_tarefas_filtrado.empty:
-
         st.divider()
 
         st.subheader(
@@ -2255,9 +2481,7 @@ if "df_pedidos" in st.session_state:
         )
 
         if tarefas_falhas:
-
             st.warning(
-
                 f"⚠️ Não foi possível consultar "
                 f"tarefas de "
                 f"{len(tarefas_falhas)} pedido(s): "
@@ -2265,45 +2489,34 @@ if "df_pedidos" in st.session_state:
             )
 
         resumo_pedido = (
-
             df_tarefas_filtrado
-
             .groupby("Pedido")
-
             .size()
-
             .reset_index(
                 name="Qtd. de Tarefas"
             )
         )
 
         st.dataframe(
-
             resumo_pedido.sort_values(
                 "Pedido"
             ),
-
             use_container_width=True,
-
-            hide_index=True
+            hide_index=True,
         )
 
         with st.expander(
             "Ver detalhamento das tarefas"
         ):
-
             st.dataframe(
-
                 df_tarefas_filtrado,
-
                 use_container_width=True,
-
-                hide_index=True
+                hide_index=True,
             )
 
 else:
-
-    st.info(
-        "Informe a faixa de pedidos na barra "
-        "lateral e clique em **Consultar**."
-    )
+    if origem == "Consulta manual":
+        st.info(
+            "Informe os pedidos na barra lateral "
+            "e clique em **Consultar**."
+        )
