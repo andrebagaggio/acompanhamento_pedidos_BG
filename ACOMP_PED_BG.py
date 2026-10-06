@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
-import pyodbc
+import pymssql
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -37,13 +37,7 @@ SQL_SERVER = st.secrets["SQL_SERVER"]
 SQL_DATABASE = st.secrets["SQL_DATABASE"]
 SQL_USERNAME = st.secrets["SQL_USERNAME"]
 SQL_PASSWORD = st.secrets["SQL_PASSWORD"]
-SQL_DRIVER = st.secrets.get("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
-
-# Opcional: se houver certificado interno sem cadeia confiável,
-# deixe SQL_TRUST_CERTIFICATE = "yes" no secrets.
-SQL_TRUST_CERTIFICATE = str(
-    st.secrets.get("SQL_TRUST_CERTIFICATE", "yes")
-).strip().lower()
+SQL_PORT = int(st.secrets.get("SQL_PORT", 1433))
 
 # Data mínima da base, conforme regra atual da consulta.
 DATA_MINIMA_SQL = date(2026, 8, 2)
@@ -271,22 +265,23 @@ def get_recursos() -> Recursos:
 # =========================================================
 # SQL SERVER
 # =========================================================
-def get_sql_connection_string() -> str:
-    trust_value = (
-        "yes"
-        if SQL_TRUST_CERTIFICATE in {"yes", "true", "1", "sim"}
-        else "no"
-    )
+def conectar_sql_server():
+    """
+    Abre conexão com SQL Server usando pymssql/FreeTDS.
 
-    return (
-        f"DRIVER={{{SQL_DRIVER}}};"
-        f"SERVER={SQL_SERVER};"
-        f"DATABASE={SQL_DATABASE};"
-        f"UID={SQL_USERNAME};"
-        f"PWD={SQL_PASSWORD};"
-        "Encrypt=yes;"
-        f"TrustServerCertificate={trust_value};"
-        "Connection Timeout=30;"
+    Essa abordagem não depende do Microsoft ODBC Driver 18
+    instalado no sistema operacional do Streamlit.
+    """
+    return pymssql.connect(
+        server=SQL_SERVER,
+        port=SQL_PORT,
+        user=SQL_USERNAME,
+        password=SQL_PASSWORD,
+        database=SQL_DATABASE,
+        login_timeout=30,
+        timeout=60,
+        charset="UTF-8",
+        as_dict=False,
     )
 
 
@@ -336,15 +331,15 @@ def carregar_base_sql(
           '101','202','303','404','505',
           '606','707','808','909'
       )
-      AND C5_EMISSAO >= ?
-      AND C5_EMISSAO <= ?
+      AND C5_EMISSAO >= %s
+      AND C5_EMISSAO <= %s
       AND D_E_L_E_T_ = ''
     """
 
     ini_sql = data_inicial.strftime("%Y%m%d")
     fim_sql = data_final.strftime("%Y%m%d")
 
-    with pyodbc.connect(get_sql_connection_string()) as conexao:
+    with conectar_sql_server() as conexao:
         df = pd.read_sql_query(
             sql,
             conexao,
