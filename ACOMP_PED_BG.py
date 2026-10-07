@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
-import pymssql
+import pyodbc
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -17,11 +17,13 @@ from urllib3.util.retry import Retry
 # CONFIGURAÇÕES / CREDENCIAIS
 # =========================================================
 # API INFOR
-CLIENT_ID = st.secrets["CI"]
-CLIENT_SECRET = st.secrets["CS"]
-USERNAME = st.secrets["USERNAME"]
-PASSWORD = st.secrets["PASSWORD"]
-TOKEN_URL = st.secrets["TOKEN"]
+# Credenciais temporárias definidas diretamente no código.
+# Depois, mova estes valores para st.secrets.
+CLIENT_ID = "US45PBYRE7XKA5QB_PRD~nauj2rSlHVtfc9RlyE25a0k6-g4pUmjWofbM3dhh4HA"
+CLIENT_SECRET = "Gd9gXitxh7y98s-mNqqhLVAjGAnOk6XXNHO01Lpu8GmA5qpqe-pHr7zDRUlSfmt5uWUSF4ad0UkGi5vqKCOA5A"
+USERNAME = "US45PBYRE7XKA5QB_PRD#5nZAFsCGU8ii2s53O0F6x_i1wCJvei_dBn2ZhokuPs_PDzup_rCAgx2bDQPg0e0sg83EAYy_FRsqs4Q0KDi7ZQ"
+PASSWORD = "qlPIwiijcMml_f4PFSLqJTQuOzw7AAM5lOtPZgTQounam0SCd4qz2kfjdw_VnE_6KscXhPHm6XeNhWcZ1Jc0KQ"
+TOKEN_URL = "https://mingle-sso.inforcloudsuite.com/US45PBYRE7XKA5QB_PRD/as/token.oauth2"
 
 WHSE_BASE_URL = (
     "https://mingle-ionapi.inforcloudsuite.com/"
@@ -33,14 +35,19 @@ BASE_URL = f"{WHSE_BASE_URL}/shipments"
 TASKS_URL = f"{WHSE_BASE_URL}/tasks/list"
 
 # SQL SERVER
-SQL_SERVER = st.secrets["SQL_SERVER"]
-SQL_DATABASE = st.secrets["SQL_DATABASE"]
-SQL_USERNAME = st.secrets["SQL_USERNAME"]
-SQL_PASSWORD = st.secrets["SQL_PASSWORD"]
-SQL_PORT = int(st.secrets.get("SQL_PORT", 1433))
+# Credenciais temporárias definidas diretamente no código.
+# Depois, mova estes valores para st.secrets.
+SQL_SERVER = "sql.totvs.bagaggio.com.br"
+SQL_PORT = 37000
+SQL_DATABASE = "CVGL35_187723_PR_PD"
+SQL_USERNAME = "CLT187723bagope"
+SQL_PASSWORD = "brjzl25364IOBZK?!"
+SQL_DRIVER = "ODBC Driver 18 for SQL Server"
+SQL_TRUST_CERTIFICATE = "yes"
 
-# Data mínima da base, conforme regra atual da consulta.
-DATA_MINIMA_SQL = date(2026, 8, 2)
+# Datas mínimas conforme as regras de cada operação.
+DATA_MINIMA_RADU = date(2026, 8, 2)
+DATA_MINIMA_BAG_ONLINE = date(2026, 1, 9)
 
 
 # =========================================================
@@ -83,6 +90,9 @@ COLUNAS_SQL = [
     "MENSAGEM_NOTA",
     "CODIGO",
     "TIPO_ATENDIMENTO",
+    "TIPO_PEDIDO",
+    "MARKETPLACE",
+    "OPERACAO",
 ]
 
 
@@ -265,37 +275,31 @@ def get_recursos() -> Recursos:
 # =========================================================
 # SQL SERVER
 # =========================================================
-def conectar_sql_server():
-    """
-    Abre conexão com SQL Server usando pymssql/FreeTDS.
+def get_sql_connection_string() -> str:
+    trust_value = (
+        "yes"
+        if SQL_TRUST_CERTIFICATE in {"yes", "true", "1", "sim"}
+        else "no"
+    )
 
-    Essa abordagem não depende do Microsoft ODBC Driver 18
-    instalado no sistema operacional do Streamlit.
-    """
-    return pymssql.connect(
-        server=SQL_SERVER,
-        port=SQL_PORT,
-        user=SQL_USERNAME,
-        password=SQL_PASSWORD,
-        database=SQL_DATABASE,
-        login_timeout=30,
-        timeout=60,
-        charset="UTF-8",
-        as_dict=False,
+    return (
+        f"DRIVER={{{SQL_DRIVER}}};"
+        f"SERVER={SQL_SERVER},{SQL_PORT};"
+        f"DATABASE={SQL_DATABASE};"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
+        "Encrypt=yes;"
+        f"TrustServerCertificate={trust_value};"
+        "Connection Timeout=30;"
     )
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def carregar_base_sql(
+def carregar_base_sql_radu(
     data_inicial: date,
     data_final: date,
 ) -> pd.DataFrame:
-    """
-    Consulta a SC5010 diretamente no SQL Server.
-
-    O filtro de data é executado no SQL para evitar carregar
-    pedidos desnecessários no Streamlit.
-    """
+    """Consulta os pedidos das filiais RADU 011004 e 011005."""
     sql = """
     SELECT
         RTRIM(C5_NUM) AS PEDIDO,
@@ -321,25 +325,86 @@ def carregar_base_sql(
             WHEN C5_XXA2B = '808' THEN 'ENXOVAL'
             WHEN C5_XXA2B = '909' THEN 'ALMOXARIFADO'
             ELSE 'REGISTRAR'
-        END AS TIPO_ATENDIMENTO
+        END AS TIPO_ATENDIMENTO,
+
+        CAST('' AS VARCHAR(50)) AS TIPO_PEDIDO,
+        CAST('' AS VARCHAR(100)) AS MARKETPLACE,
+        CAST('RADU' AS VARCHAR(20)) AS OPERACAO
 
     FROM SC5010 WITH (NOLOCK)
 
-    WHERE C5_FILIAL IN ('011004', '011005', '011324')
+    WHERE C5_FILIAL IN ('011004', '011005')
       AND C5_EMISSAO > '20260801'
       AND C5_XXA2B IN (
           '101','202','303','404','505',
           '606','707','808','909'
       )
-      AND C5_EMISSAO >= %s
-      AND C5_EMISSAO <= %s
+      AND C5_EMISSAO >= ?
+      AND C5_EMISSAO <= ?
       AND D_E_L_E_T_ = ''
     """
 
+    return _executar_consulta_sql_operacao(
+        sql,
+        data_inicial,
+        data_final,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def carregar_base_sql_bag_online(
+    data_inicial: date,
+    data_final: date,
+) -> pd.DataFrame:
+    """Consulta os pedidos da BAG ONLINE, filial 011324."""
+    sql = """
+    SELECT
+        RTRIM(L1_NUM) AS PEDIDO,
+        CAST('011324' AS VARCHAR(6)) AS FILIAL,
+        L1_EMISSAO AS DATA_CRIACAO,
+        CAST('' AS VARCHAR(1)) AS MENSAGEM_NOTA,
+        CAST('' AS VARCHAR(1)) AS CODIGO,
+        CAST('' AS VARCHAR(1)) AS TIPO_ATENDIMENTO,
+
+        CASE
+            WHEN LEFT(L1_ECPEDEC, 3) = 'ANY' THEN 'MARKETPLACE'
+            WHEN LEFT(L1_ECPEDEC, 3) = 'SLR' THEN 'SITE'
+            ELSE 'ANALISAR'
+        END AS TIPO_PEDIDO,
+
+        CASE
+            WHEN L1_XMARKET = '' THEN 'SITE'
+            ELSE RTRIM(L1_XMARKET)
+        END AS MARKETPLACE,
+
+        CAST('BAG ONLINE' AS VARCHAR(20)) AS OPERACAO
+
+    FROM SL1010 WITH (NOLOCK)
+
+    WHERE L1_FILIAL = '011324'
+      AND L1_EMISSAO > '20260108'
+      AND L1_EMISSAO >= ?
+      AND L1_EMISSAO <= ?
+
+    ORDER BY L1_EMISSAO DESC
+    """
+
+    return _executar_consulta_sql_operacao(
+        sql,
+        data_inicial,
+        data_final,
+    )
+
+
+def _executar_consulta_sql_operacao(
+    sql: str,
+    data_inicial: date,
+    data_final: date,
+) -> pd.DataFrame:
     ini_sql = data_inicial.strftime("%Y%m%d")
     fim_sql = data_final.strftime("%Y%m%d")
 
-    with conectar_sql_server() as conexao:
+    with pyodbc.connect(get_sql_connection_string()) as conexao:
         df = pd.read_sql_query(
             sql,
             conexao,
@@ -355,6 +420,9 @@ def carregar_base_sql(
         "MENSAGEM_NOTA",
         "CODIGO",
         "TIPO_ATENDIMENTO",
+        "TIPO_PEDIDO",
+        "MARKETPLACE",
+        "OPERACAO",
     ):
         if coluna in df.columns:
             df[coluna] = (
@@ -373,7 +441,7 @@ def carregar_base_sql(
     return df
 
 
-def aplicar_filtros_sql(
+def aplicar_filtros_radu(
     df_sql: pd.DataFrame,
     filiais: list[str],
     tipos: list[str],
@@ -383,12 +451,38 @@ def aplicar_filtros_sql(
 
     if filiais:
         df = df[df["FILIAL"].isin(filiais)]
+    else:
+        return df.iloc[0:0]
 
     if tipos:
         df = df[df["TIPO_ATENDIMENTO"].isin(tipos)]
+    else:
+        return df.iloc[0:0]
 
     if codigos:
         df = df[df["CODIGO"].isin(codigos)]
+    else:
+        return df.iloc[0:0]
+
+    return df
+
+
+def aplicar_filtros_bag_online(
+    df_sql: pd.DataFrame,
+    tipos_pedido: list[str],
+    marketplaces: list[str],
+) -> pd.DataFrame:
+    df = df_sql.copy()
+
+    if tipos_pedido:
+        df = df[df["TIPO_PEDIDO"].isin(tipos_pedido)]
+    else:
+        return df.iloc[0:0]
+
+    if marketplaces:
+        df = df[df["MARKETPLACE"].isin(marketplaces)]
+    else:
+        return df.iloc[0:0]
 
     return df
 
@@ -1228,6 +1322,20 @@ with st.sidebar:
         ],
     )
 
+    operacao_sql = None
+    if origem == "SQL Server":
+        operacao_sql = st.radio(
+            "Operação / filial",
+            [
+                "RADU - 011004 / 011005",
+                "BAG ONLINE - 011324",
+            ],
+            help=(
+                "A operação selecionada define a consulta SQL "
+                "e os filtros disponíveis."
+            ),
+        )
+
     paralelismo = st.slider(
         "Consultas simultâneas na API",
         min_value=1,
@@ -1251,34 +1359,51 @@ with st.sidebar:
 # =========================================================
 if origem == "SQL Server":
     hoje = date.today()
+    eh_radu = operacao_sql.startswith("RADU")
+
+    data_minima_operacao = (
+        DATA_MINIMA_RADU
+        if eh_radu
+        else DATA_MINIMA_BAG_ONLINE
+    )
+
     default_ini = max(
-        DATA_MINIMA_SQL,
+        data_minima_operacao,
         hoje - timedelta(days=7),
     )
 
-    with st.sidebar.form("form_sql"):
-        st.subheader("Base SQL")
+    chave_operacao = "radu" if eh_radu else "bag_online"
+
+    with st.sidebar.form(f"form_sql_{chave_operacao}"):
+        st.subheader(
+            "RADU" if eh_radu else "BAG ONLINE"
+        )
 
         data_inicial = st.date_input(
             "Data inicial",
             value=default_ini,
-            min_value=DATA_MINIMA_SQL,
+            min_value=data_minima_operacao,
             max_value=hoje,
             format="DD/MM/YYYY",
+            key=f"data_ini_{chave_operacao}",
         )
 
         data_final = st.date_input(
             "Data final",
             value=hoje,
-            min_value=DATA_MINIMA_SQL,
+            min_value=data_minima_operacao,
             max_value=hoje,
             format="DD/MM/YYYY",
+            key=f"data_fim_{chave_operacao}",
         )
 
         carregar_sql = st.form_submit_button(
             "🔄 Carregar filtros",
             use_container_width=True,
         )
+
+    chave_df = f"df_base_sql_{chave_operacao}"
+    chave_periodo = f"periodo_sql_{chave_operacao}"
 
     if carregar_sql:
         if data_final < data_inicial:
@@ -1291,18 +1416,19 @@ if origem == "SQL Server":
                 with st.spinner(
                     "Consultando a base no SQL Server..."
                 ):
-                    df_base_sql = carregar_base_sql(
-                        data_inicial,
-                        data_final,
-                    )
+                    if eh_radu:
+                        df_base_sql = carregar_base_sql_radu(
+                            data_inicial,
+                            data_final,
+                        )
+                    else:
+                        df_base_sql = carregar_base_sql_bag_online(
+                            data_inicial,
+                            data_final,
+                        )
 
-                st.session_state["df_base_sql"] = (
-                    df_base_sql
-                )
-
-                st.session_state[
-                    "periodo_sql"
-                ] = (
+                st.session_state[chave_df] = df_base_sql
+                st.session_state[chave_periodo] = (
                     data_inicial,
                     data_final,
                 )
@@ -1314,84 +1440,105 @@ if origem == "SQL Server":
                 )
 
     df_base_sql = st.session_state.get(
-        "df_base_sql",
+        chave_df,
         pd.DataFrame(columns=COLUNAS_SQL),
     )
 
     if not df_base_sql.empty:
-        periodo_sql = st.session_state.get(
-            "periodo_sql"
-        )
+        periodo_sql = st.session_state.get(chave_periodo)
 
         if periodo_sql:
+            nome_operacao = "RADU" if eh_radu else "BAG ONLINE"
             st.info(
-                "Base carregada do SQL Server: "
+                f"Base **{nome_operacao}** carregada do SQL Server: "
                 f"**{periodo_sql[0].strftime('%d/%m/%Y')}** "
                 "até "
                 f"**{periodo_sql[1].strftime('%d/%m/%Y')}** "
-                f"• **{df_base_sql['PEDIDO'].nunique():,} "
-                "pedidos**"
+                f"• **{df_base_sql['PEDIDO'].nunique():,} pedidos**"
                 .replace(",", ".")
             )
 
-        filiais_disponiveis = sorted(
-            df_base_sql["FILIAL"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-
-        tipos_disponiveis = sorted(
-            df_base_sql["TIPO_ATENDIMENTO"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-
-        codigos_disponiveis = sorted(
-            df_base_sql["CODIGO"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-
-        with st.sidebar.form("form_filtros_sql"):
-            st.subheader("Filtros operacionais")
-
-            filiais_selecionadas = st.multiselect(
-                "Filial",
-                options=filiais_disponiveis,
-                default=filiais_disponiveis,
+        if eh_radu:
+            filiais_disponiveis = sorted(
+                df_base_sql["FILIAL"].dropna().unique().tolist()
+            )
+            tipos_disponiveis = sorted(
+                df_base_sql["TIPO_ATENDIMENTO"].dropna().unique().tolist()
+            )
+            codigos_disponiveis = sorted(
+                df_base_sql["CODIGO"].dropna().unique().tolist()
             )
 
-            tipos_selecionados = st.multiselect(
-                "Tipo de atendimento",
-                options=tipos_disponiveis,
-                default=tipos_disponiveis,
+            with st.sidebar.form("form_filtros_radu"):
+                st.subheader("Filtros RADU")
+
+                filiais_selecionadas = st.multiselect(
+                    "Filial",
+                    options=filiais_disponiveis,
+                    default=filiais_disponiveis,
+                )
+
+                tipos_selecionados = st.multiselect(
+                    "Tipo de atendimento",
+                    options=tipos_disponiveis,
+                    default=tipos_disponiveis,
+                )
+
+                codigos_selecionados = st.multiselect(
+                    "Código",
+                    options=codigos_disponiveis,
+                    default=codigos_disponiveis,
+                    help=(
+                        "Código validado no padrão 000000-000. "
+                        "Casos fora do padrão aparecem como 'Sem código'."
+                    ),
+                )
+
+                consultar_sql_api = st.form_submit_button(
+                    "🔍 Consultar no Infor",
+                    use_container_width=True,
+                )
+
+            df_preview_sql = aplicar_filtros_radu(
+                df_base_sql,
+                filiais_selecionadas,
+                tipos_selecionados,
+                codigos_selecionados,
             )
 
-            codigos_selecionados = st.multiselect(
-                "Código",
-                options=codigos_disponiveis,
-                default=codigos_disponiveis,
-                help=(
-                    "Código validado no padrão 000000-000. "
-                    "Casos fora do padrão aparecem como "
-                    "'Sem código'."
-                ),
+        else:
+            tipos_pedido_disponiveis = sorted(
+                df_base_sql["TIPO_PEDIDO"].dropna().unique().tolist()
+            )
+            marketplaces_disponiveis = sorted(
+                df_base_sql["MARKETPLACE"].dropna().unique().tolist()
             )
 
-            consultar_sql_api = st.form_submit_button(
-                "🔍 Consultar no Infor",
-                use_container_width=True,
-            )
+            with st.sidebar.form("form_filtros_bag_online"):
+                st.subheader("Filtros BAG ONLINE")
 
-        df_preview_sql = aplicar_filtros_sql(
-            df_base_sql,
-            filiais_selecionadas,
-            tipos_selecionados,
-            codigos_selecionados,
-        )
+                tipos_pedido_selecionados = st.multiselect(
+                    "Tipo de pedido",
+                    options=tipos_pedido_disponiveis,
+                    default=tipos_pedido_disponiveis,
+                )
+
+                marketplaces_selecionados = st.multiselect(
+                    "Marketplace",
+                    options=marketplaces_disponiveis,
+                    default=marketplaces_disponiveis,
+                )
+
+                consultar_sql_api = st.form_submit_button(
+                    "🔍 Consultar no Infor",
+                    use_container_width=True,
+                )
+
+            df_preview_sql = aplicar_filtros_bag_online(
+                df_base_sql,
+                tipos_pedido_selecionados,
+                marketplaces_selecionados,
+            )
 
         st.subheader("🧾 Seleção do SQL Server")
 
@@ -1399,14 +1546,12 @@ if origem == "SQL Server":
 
         p1.metric(
             "Pedidos selecionados",
-            f"{df_preview_sql['PEDIDO'].nunique():,}"
-            .replace(",", "."),
+            f"{df_preview_sql['PEDIDO'].nunique():,}".replace(",", "."),
         )
 
         p2.metric(
             "Registros SQL",
-            f"{len(df_preview_sql):,}"
-            .replace(",", "."),
+            f"{len(df_preview_sql):,}".replace(",", "."),
         )
 
         p3.metric(
@@ -1414,12 +1559,16 @@ if origem == "SQL Server":
             df_preview_sql["FILIAL"].nunique(),
         )
 
-        p4.metric(
-            "Tipos de atendimento",
-            df_preview_sql[
-                "TIPO_ATENDIMENTO"
-            ].nunique(),
-        )
+        if eh_radu:
+            p4.metric(
+                "Tipos de atendimento",
+                df_preview_sql["TIPO_ATENDIMENTO"].nunique(),
+            )
+        else:
+            p4.metric(
+                "Marketplaces",
+                df_preview_sql["MARKETPLACE"].nunique(),
+            )
 
         with st.expander(
             "Ver pedidos selecionados no SQL",
@@ -1427,13 +1576,25 @@ if origem == "SQL Server":
         ):
             preview = df_preview_sql.copy()
 
-            preview["DATA_CRIACAO"] = (
-                preview["DATA_CRIACAO"]
-                .dt.strftime("%d/%m/%Y")
+            if "DATA_CRIACAO" in preview.columns:
+                preview["DATA_CRIACAO"] = (
+                    preview["DATA_CRIACAO"].dt.strftime("%d/%m/%Y")
+                )
+
+            colunas_preview = (
+                [
+                    "PEDIDO", "FILIAL", "DATA_CRIACAO",
+                    "MENSAGEM_NOTA", "CODIGO", "TIPO_ATENDIMENTO",
+                ]
+                if eh_radu
+                else [
+                    "PEDIDO", "FILIAL", "DATA_CRIACAO",
+                    "TIPO_PEDIDO", "MARKETPLACE",
+                ]
             )
 
             st.dataframe(
-                preview,
+                preview[colunas_preview],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1453,7 +1614,11 @@ if origem == "SQL Server":
                 executar_api_para_lista(
                     lista_pedidos=lista_pedidos,
                     paralelismo=paralelismo,
-                    origem_consulta="SQL Server",
+                    origem_consulta=(
+                        "SQL Server - RADU"
+                        if eh_radu
+                        else "SQL Server - BAG ONLINE"
+                    ),
                     df_sql_selecionado=df_preview_sql,
                 )
             except requests.exceptions.HTTPError as e:
@@ -1466,10 +1631,10 @@ if origem == "SQL Server":
                 )
 
     else:
+        nome_operacao = "RADU" if eh_radu else "BAG ONLINE"
         st.info(
-            "Selecione o período na barra lateral e clique "
-            "em **Carregar filtros** para consultar o "
-            "SQL Server."
+            f"Selecione o período de **{nome_operacao}** na barra lateral "
+            "e clique em **Carregar filtros**."
         )
 
 
@@ -1502,12 +1667,8 @@ else:
         else:
             texto_pedidos = st.text_area(
                 "Pedidos",
-                placeholder=(
-                    "pedido1 or pedido2 or pedido3"
-                ),
-                help=(
-                    "Separe os pedidos com 'or'."
-                ),
+                placeholder="pedido1 or pedido2 or pedido3",
+                help="Separe os pedidos com 'or'.",
             )
 
         consultar_manual = st.form_submit_button(
@@ -1534,14 +1695,10 @@ else:
                 ]
 
             else:
-                lista_pedidos = parse_lista_or(
-                    texto_pedidos
-                )
+                lista_pedidos = parse_lista_or(texto_pedidos)
 
                 if not lista_pedidos:
-                    st.warning(
-                        "Informe ao menos um pedido."
-                    )
+                    st.warning("Informe ao menos um pedido.")
                     st.stop()
 
             executar_api_para_lista(
@@ -1593,7 +1750,7 @@ if "df_pedidos" in st.session_state:
     )
 
     if (
-        origem_resultado == "SQL Server"
+        origem_resultado.startswith("SQL Server")
         and isinstance(
             df_sql_selecionado,
             pd.DataFrame,
@@ -1635,6 +1792,9 @@ if "df_pedidos" in st.session_state:
         df["MENSAGEM_NOTA"] = ""
         df["CODIGO"] = ""
         df["TIPO_ATENDIMENTO"] = ""
+        df["TIPO_PEDIDO"] = ""
+        df["MARKETPLACE"] = ""
+        df["OPERACAO"] = ""
 
     falhas = st.session_state.get(
         "falhas",
@@ -1675,6 +1835,10 @@ if "df_pedidos" in st.session_state:
     st.divider()
     st.subheader("🎛️ Filtros do dashboard")
 
+    eh_resultado_bag_online = (
+        origem_resultado == "SQL Server - BAG ONLINE"
+    )
+
     fd1, fd2, fd3, fd4 = st.columns(4)
 
     with fd1:
@@ -1707,57 +1871,80 @@ if "df_pedidos" in st.session_state:
             default=mensagens_disponiveis,
         )
 
-    with fd3:
-        if "TIPO_ATENDIMENTO" in df.columns:
+    if eh_resultado_bag_online:
+        with fd3:
+            tipos_dashboard = sorted(
+                df["TIPO_PEDIDO"]
+                .dropna()
+                .astype(str)
+                .loc[lambda s: s.str.strip() != ""]
+                .unique()
+                .tolist()
+            )
+
+            tipos_dashboard_sel = st.multiselect(
+                "Tipo de pedido",
+                options=tipos_dashboard,
+                default=tipos_dashboard,
+                disabled=not bool(tipos_dashboard),
+            )
+
+        with fd4:
+            codigos_dashboard = sorted(
+                df["MARKETPLACE"]
+                .dropna()
+                .astype(str)
+                .loc[lambda s: s.str.strip() != ""]
+                .unique()
+                .tolist()
+            )
+
+            codigos_dashboard_sel = st.multiselect(
+                "Marketplace",
+                options=codigos_dashboard,
+                default=codigos_dashboard,
+                disabled=not bool(codigos_dashboard),
+            )
+    else:
+        with fd3:
             tipos_dashboard = sorted(
                 df["TIPO_ATENDIMENTO"]
                 .dropna()
                 .astype(str)
-                .loc[
-                    lambda s: s.str.strip() != ""
-                ]
+                .loc[lambda s: s.str.strip() != ""]
                 .unique()
                 .tolist()
             )
-        else:
-            tipos_dashboard = []
 
-        tipos_dashboard_sel = st.multiselect(
-            "Tipo atendimento",
-            options=tipos_dashboard,
-            default=tipos_dashboard,
-            disabled=not bool(tipos_dashboard),
-        )
+            tipos_dashboard_sel = st.multiselect(
+                "Tipo atendimento",
+                options=tipos_dashboard,
+                default=tipos_dashboard,
+                disabled=not bool(tipos_dashboard),
+            )
 
-    with fd4:
-        if "CODIGO" in df.columns:
+        with fd4:
             codigos_dashboard = sorted(
                 df["CODIGO"]
                 .dropna()
                 .astype(str)
-                .loc[
-                    lambda s: s.str.strip() != ""
-                ]
+                .loc[lambda s: s.str.strip() != ""]
                 .unique()
                 .tolist()
             )
-        else:
-            codigos_dashboard = []
 
-        codigos_dashboard_sel = st.multiselect(
-            "Código",
-            options=codigos_dashboard,
-            default=codigos_dashboard,
-            disabled=not bool(codigos_dashboard),
-        )
+            codigos_dashboard_sel = st.multiselect(
+                "Código",
+                options=codigos_dashboard,
+                default=codigos_dashboard,
+                disabled=not bool(codigos_dashboard),
+            )
 
     df_filtrado = df.copy()
 
     if status_selecionados:
         df_filtrado = df_filtrado[
-            df_filtrado["Status"].isin(
-                status_selecionados
-            )
+            df_filtrado["Status"].isin(status_selecionados)
         ]
     else:
         df_filtrado = df_filtrado.iloc[0:0]
@@ -1771,12 +1958,21 @@ if "df_pedidos" in st.session_state:
     else:
         df_filtrado = df_filtrado.iloc[0:0]
 
+    coluna_tipo = (
+        "TIPO_PEDIDO"
+        if eh_resultado_bag_online
+        else "TIPO_ATENDIMENTO"
+    )
+    coluna_quarto_filtro = (
+        "MARKETPLACE"
+        if eh_resultado_bag_online
+        else "CODIGO"
+    )
+
     if tipos_dashboard:
         if tipos_dashboard_sel:
             df_filtrado = df_filtrado[
-                df_filtrado[
-                    "TIPO_ATENDIMENTO"
-                ].isin(tipos_dashboard_sel)
+                df_filtrado[coluna_tipo].isin(tipos_dashboard_sel)
             ]
         else:
             df_filtrado = df_filtrado.iloc[0:0]
@@ -1784,9 +1980,9 @@ if "df_pedidos" in st.session_state:
     if codigos_dashboard:
         if codigos_dashboard_sel:
             df_filtrado = df_filtrado[
-                df_filtrado[
-                    "CODIGO"
-                ].isin(codigos_dashboard_sel)
+                df_filtrado[coluna_quarto_filtro].isin(
+                    codigos_dashboard_sel
+                )
             ]
         else:
             df_filtrado = df_filtrado.iloc[0:0]
